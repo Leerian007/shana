@@ -28,6 +28,9 @@ public class ChatMessageEntity {
     /** 角色，存小写字符串：system / user / assistant / tool */
     private String role;
 
+    /** 发送者标识（群成员 ID），system / assistant 消息为空；供后续按人统计与画像使用 */
+    private String senderId;
+
     private String content;
 
     private OffsetDateTime createdAt;

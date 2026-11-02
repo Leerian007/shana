@@ -25,6 +25,8 @@ public class ChatController {
 
     @PostMapping
     public Result<ChatReplyVO> chat(@Valid @RequestBody ChatRequestDTO request) {
-        return Result.success(ChatReplyVO.from(chatService.reply(request.conversationId(), request.message())));
+        // senderId 只透传落库，不参与回复生成
+        return Result.success(ChatReplyVO.from(
+                chatService.reply(request.conversationId(), request.senderId(), request.message())));
     }
 }

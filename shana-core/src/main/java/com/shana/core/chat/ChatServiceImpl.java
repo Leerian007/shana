@@ -44,9 +44,10 @@ public class ChatServiceImpl implements ChatService {
     }
 
     @Override
-    public ChatReply reply(String conversationId, String message) {
-        // 1. 先写入用户消息：即使本次调用失败，用户说过的话也留在上下文里，下一轮仍能接上
-        conversationMemory.append(conversationId, ChatMessage.user(message));
+    public ChatReply reply(String conversationId, String senderId, String message) {
+        // 1. 先写入用户消息：即使本次调用失败，用户说过的话也留在上下文里，下一轮仍能接上。
+        //    senderId 只是随消息落库的旁路信息，下面组装 prompt 时不会用到它
+        conversationMemory.append(conversationId, ChatMessage.user(senderId, message));
 
         // 2. 组装 prompt：system 人设 + 本会话最近历史（history 已包含刚写入的这条，顺序为时间正序）
         List<ChatMessage> history = conversationMemory.history(conversationId);

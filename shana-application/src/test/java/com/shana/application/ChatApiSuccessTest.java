@@ -38,13 +38,13 @@ class ChatApiSuccessTest {
     @Test
     @DisplayName("POST /api/v1/chat 返回统一结构与 token 用量")
     void shouldReturnUnifiedChatResponse() throws Exception {
-        given(chatService.reply("group-1", "你好"))
+        given(chatService.reply("group-1", "u-1001", "你好"))
                 .willReturn(new ChatReply("group-1", "我是 Shana", new TokenUsage(5, 9)));
 
         mockMvc.perform(post("/api/v1/chat")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"conversationId":"group-1","message":"你好"}
+                                {"conversationId":"group-1","senderId":"u-1001","message":"你好"}
                                 """))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.code").value(200))
@@ -53,6 +53,21 @@ class ChatApiSuccessTest {
                 .andExpect(jsonPath("$.data.content").value("我是 Shana"))
                 .andExpect(jsonPath("$.data.promptTokens").value(5))
                 .andExpect(jsonPath("$.data.completionTokens").value(9));
+    }
+
+    @Test
+    @DisplayName("不传 senderId 时照常回复：该字段只用于留存，不能阻塞主链路")
+    void shouldWorkWithoutSenderId() throws Exception {
+        given(chatService.reply("group-2", null, "在吗"))
+                .willReturn(new ChatReply("group-2", "在", TokenUsage.unknown()));
+
+        mockMvc.perform(post("/api/v1/chat")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"conversationId":"group-2","message":"在吗"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.content").value("在"));
     }
 
     @Test

@@ -55,6 +55,21 @@ class ChatServiceImplTest {
     }
 
     @Test
+    @DisplayName("发送者标识随消息写入上下文，供后续按人统计")
+    void shouldPersistSenderIdWithUserMessage() {
+        given(memory.history(CONVERSATION_ID)).willReturn(List.of());
+        given(llmClient.chat(any())).willReturn(
+                new ChatResponse("收到", LlmProvider.OPENAI_COMPATIBLE, "test-model", TokenUsage.unknown()));
+
+        chatService.reply(CONVERSATION_ID, "u-1001", "你好");
+
+        // 落库侧带上了发送者
+        verify(memory).append(CONVERSATION_ID, ChatMessage.user("u-1001", "你好"));
+        // 助手回复没有发送者概念
+        verify(memory).append(CONVERSATION_ID, ChatMessage.assistant("收到"));
+    }
+
+    @Test
     @DisplayName("按 system + 历史正序组装 prompt，并回写助手回复")
     void shouldAssemblePromptInOrderAndWriteBack() {
         given(memory.history(CONVERSATION_ID)).willReturn(List.of(

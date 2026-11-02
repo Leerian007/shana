@@ -40,9 +40,9 @@ class JdbcConversationMemoryTest {
     }
 
     @Test
-    @DisplayName("追加消息：角色转小写，写入会话 ID、内容与时间")
+    @DisplayName("追加消息：角色转小写，写入会话 ID、发送者、内容与时间")
     void appendWritesLowercaseRoleAndTimestamp() {
-        memory.append("group-1", ChatMessage.user("你好"));
+        memory.append("group-1", ChatMessage.user("u-1001", "你好"));
 
         ArgumentCaptor<ChatMessageEntity> captor = ArgumentCaptor.forClass(ChatMessageEntity.class);
         verify(mapper).insert(captor.capture());
@@ -51,6 +51,8 @@ class JdbcConversationMemoryTest {
         assertThat(saved.getConversationId()).isEqualTo("group-1");
         // 枚举名大写是为了 Java 侧可读，入库统一小写，和主流 Chat API 一致
         assertThat(saved.getRole()).isEqualTo("user");
+        // 发送者是留给事后统计的原始数据，必须原样落库
+        assertThat(saved.getSenderId()).isEqualTo("u-1001");
         assertThat(saved.getContent()).isEqualTo("你好");
         assertThat(saved.getCreatedAt()).isNotNull();
     }
@@ -61,6 +63,7 @@ class JdbcConversationMemoryTest {
         // 数据库返回的是"最近的在前"
         ChatMessageEntity newer = entity(2L, "assistant", "第二句");
         ChatMessageEntity older = entity(1L, "user", "第一句");
+        older.setSenderId("u-1001");
         Page<ChatMessageEntity> page = new Page<>(1, 20, false);
         page.setRecords(List.of(newer, older));
         doReturn(page).when(mapper).selectPage(any(), any());
@@ -68,7 +71,7 @@ class JdbcConversationMemoryTest {
         List<ChatMessage> history = memory.history("group-1");
 
         assertThat(history).containsExactly(
-                new ChatMessage(ChatRole.USER, "第一句"),
+                new ChatMessage(ChatRole.USER, "u-1001", "第一句"),
                 new ChatMessage(ChatRole.ASSISTANT, "第二句"));
     }
 

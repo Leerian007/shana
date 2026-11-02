@@ -3,8 +3,9 @@
 一个以 Java 为核心的 AI 应用平台，第一阶段目标是跑通工程骨架，后续逐步演进为群聊 AI 助手：
 接入云端 / 本地 / 自建微调模型，管理群聊上下文与长期记忆，支持 RAG、Agent 与工具调用。
 
-当前代码只包含工程初始化（分层结构、统一响应、异常处理、健康检查、本地基础设施编排），
-**尚未实现任何 AI 业务逻辑**。
+当前已完成：工程骨架（分层结构、统一响应、异常处理、健康检查、本地基础设施编排）、
+OpenAI 兼容协议的模型适配层、`POST /api/v1/chat` 问答链路、以及基于 PostgreSQL 的会话持久化。
+**尚未实现**长期记忆、RAG、Agent 循环与群成员画像。
 
 ---
 
@@ -309,25 +310,33 @@ mvn -pl shana-application test -Dtest=LiveChatSmokeTest
 ### 表结构
 
 由 Flyway 在启动时自动创建，脚本位置：
-`shana-infrastructure/src/main/resources/db/migration/V1__create_chat_message.sql`
+
+- `shana-infrastructure/src/main/resources/db/migration/V1__create_chat_message.sql`
+- `shana-infrastructure/src/main/resources/db/migration/V2__add_sender_id_to_chat_message.sql`
 
 ```
 chat_message
 ├── id               BIGSERIAL     主键，自增
 ├── conversation_id  VARCHAR(64)   会话/群聊标识，由调用方提供
 ├── role             VARCHAR(16)   system / user / assistant / tool（小写）
+├── sender_id        VARCHAR(64)   发送者标识（群成员 ID），可空；V2 新增
 ├── content          TEXT
 └── created_at       TIMESTAMPTZ   默认 now()
 索引：idx_chat_message_conversation_id_desc (conversation_id, id DESC)
+      idx_chat_message_sender_id           (conversation_id, sender_id, id DESC)
 ```
 
-两个刻意的设计取舍：
+三个刻意的设计取舍：
 
 1. **没有单独的 conversation 表**。当前没有任何会话级属性要存（群名、人设 prompt 都还没做），
    先建一张只有主键的空表属于过度设计。等需要按群配置时再加迁移脚本。
 2. **不删除超窗口的历史消息**。内存实现为了省内存会淘汰旧消息，
    但数据库里的全量历史是长期记忆、群聊月度总结的原料。
    窗口只限制"读多少条"（`LIMIT`），不删数据。
+3. **`sender_id` 只为留存，不回填历史、不造默认值**。V2 之前写入的消息确实没采集过发送者，
+   补一个假值会让"真的没传"和"就是这个人"混在一起，直接污染后续统计。
+   分析时用 `sender_id IS NOT NULL` 或 `role = 'user'` 过滤即可。
+   该字段不参与问答链路，拼 prompt 时不会被读取。
 
 ### 实现切换
 
@@ -350,8 +359,14 @@ SHANA_MEMORY_STORE=memory FLYWAY_ENABLED=false mvn -pl shana-application spring-
 SELECT conversation_id, count(*) FROM chat_message GROUP BY conversation_id;
 
 -- 查看某个群最近的对话
-SELECT id, role, content, created_at FROM chat_message
+SELECT id, role, sender_id, content, created_at FROM chat_message
 WHERE conversation_id = 'group-1' ORDER BY id DESC LIMIT 10;
+
+-- 按成员统计发言量（sender_id 为空的记录是 V2 之前的历史数据或未传 senderId 的消息）
+SELECT sender_id, count(*) AS messages
+FROM chat_message
+WHERE conversation_id = 'group-1' AND sender_id IS NOT NULL
+GROUP BY sender_id ORDER BY messages DESC;
 ```
 
 ---
@@ -408,7 +423,7 @@ SERVER_PORT
 ```bash
 curl -X POST http://localhost:8080/api/v1/chat \
   -H "Content-Type: application/json" \
-  -d '{"conversationId":"group-1","message":"你好"}'
+  -d '{"conversationId":"group-1","senderId":"u-1001","message":"你好"}'
 ```
 
 ```json
@@ -427,7 +442,11 @@ curl -X POST http://localhost:8080/api/v1/chat \
 | 入参 | 校验 | 说明 |
 | --- | --- | --- |
 | `conversationId` | 非空、≤64 | 会话维度，用于隔离上下文 |
+| `senderId` | 可选、≤64 | 发送者标识（群成员 ID）。**不参与生成回复**，只随消息落库供后续按人统计使用 |
 | `message` | 非空、≤2000 | 用户消息正文 |
+
+> `senderId` 是数据采集字段：它存在 `chat_message.sender_id` 里，拼 prompt 时不会被读取。
+> 接入真实群聊时应当传入，否则该条消息无法归属到具体成员（历史数据不回填，也不造默认值）。
 
 失败场景：参数不合法返回 `400`；没有可用模型适配器（未配置 api-key）或上游调用失败返回 `503`。
 两种失败都使用统一响应结构，`data` 为 `null`。

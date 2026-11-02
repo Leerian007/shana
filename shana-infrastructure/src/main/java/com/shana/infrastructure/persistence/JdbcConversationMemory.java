@@ -52,6 +52,8 @@ public class JdbcConversationMemory implements ConversationMemory {
         entity.setConversationId(conversationId);
         // 枚举名转小写入库，与主流 Chat API 的角色写法一致，也避免大小写不一致导致查不出来
         entity.setRole(message.role().name().toLowerCase(Locale.ROOT));
+        // 发送者只做留存：写库是为了以后能按人聚合，读出来拼 prompt 时不会被使用
+        entity.setSenderId(message.senderId());
         entity.setContent(message.content());
         entity.setCreatedAt(OffsetDateTime.now());
         chatMessageMapper.insert(entity);
@@ -82,7 +84,7 @@ public class JdbcConversationMemory implements ConversationMemory {
     }
 
     private ChatMessage toChatMessage(ChatMessageEntity entity) {
-        return new ChatMessage(parseRole(entity.getRole()), entity.getContent());
+        return new ChatMessage(parseRole(entity.getRole()), entity.getSenderId(), entity.getContent());
     }
 
     private ChatRole parseRole(String role) {
