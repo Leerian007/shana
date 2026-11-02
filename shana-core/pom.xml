@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.shana</groupId>
+        <artifactId>shana</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>shana-core</artifactId>
+    <name>shana-core</name>
+    <description>核心业务接口与领域模型，编排模型、记忆、工具等能力</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.shana</groupId>
+            <artifactId>shana-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.shana</groupId>
+            <artifactId>shana-model</artifactId>
+        </dependency>
+        <!-- core 负责编排"模型调用 + 上下文"，因此依赖记忆模块；memory 不反向依赖 core，无循环 -->
+        <dependency>
+            <groupId>com.shana</groupId>
+            <artifactId>shana-memory</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
+        </dependency>
+    </dependencies>
+</project>

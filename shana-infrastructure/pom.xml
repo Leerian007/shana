@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.shana</groupId>
+        <artifactId>shana</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>shana-infrastructure</artifactId>
+    <name>shana-infrastructure</name>
+    <description>基础设施实现：PostgreSQL/MyBatis-Plus、Redis 等</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.shana</groupId>
+            <artifactId>shana-core</artifactId>
+        </dependency>
+        <!-- 实现 memory 定义的 ConversationMemory 端口（core 本身不依赖 memory） -->
+        <dependency>
+            <groupId>com.shana</groupId>
+            <artifactId>shana-memory</artifactId>
+        </dependency>
+
+        <!-- 数据访问：MyBatis-Plus + PostgreSQL 驱动 -->
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-jsqlparser</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- 数据库版本管理：Flyway 10 起 PostgreSQL 支持拆到独立模块 -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
+        </dependency>
+
+        <!-- 缓存与会话状态：当前仅引入客户端，连接在首次使用时才建立 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+    </dependencies>
+</project>

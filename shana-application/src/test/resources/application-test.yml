@@ -1,0 +1,21 @@
+# 集成测试专用配置（@ActiveProfiles("test")）
+#
+# 目的是让 mvn test 保持"离线、可重复、零外部依赖"：
+# 单元测试和接口测试不应该因为本机没开 PostgreSQL 就红掉。
+# 真实数据库行为由 JdbcConversationMemoryTest（Mock 验证 SQL 语义）
+# 和手动联调（启动应用 + curl + 查库）覆盖。
+spring:
+  flyway:
+    enabled: false
+  # 数据源自动配置仍然存在，但没有任何代码在测试里真正取连接
+
+shana:
+  memory:
+    # 切回进程内实现，避免测试依赖数据库
+    store: memory
+
+management:
+  health:
+    # 测试环境没有数据库，关掉这项健康检查，否则 /actuator/health 会报 DOWN
+    db:
+      enabled: false

@@ -1,0 +1,99 @@
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+spring:
+  application:
+    name: shana
+  config:
+    # 本地密钥文件（见 .gitignore）；文件不存在时忽略，不影响他人启动
+    import: optional:classpath:application-secret.yml
+  profiles:
+    # 本地默认使用 dev；部署时通过 --spring.profiles.active=prod 覆盖
+    default: dev
+  jackson:
+    time-zone: Asia/Shanghai
+    serialization:
+      write-dates-as-timestamps: false
+  servlet:
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 20MB
+
+  # 数据库已成为会话持久化的必需依赖：Hikari 在首次真正取连接时才建连，
+  # initialization-fail-timeout = -1 让"连接池初始化"不阻塞启动，
+  # 但 Flyway 迁移会在启动期真正连库，数据库不可用时应用会明确失败（比带病运行好排查）。
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:shana}
+    username: ${DB_USER:shana}
+    password: ${DB_PASSWORD:shana}
+    hikari:
+      pool-name: shana-hikari
+      maximum-pool-size: 10
+      minimum-idle: 2
+      initialization-fail-timeout: -1
+      connection-timeout: 5000
+
+  # 表结构由 SQL 脚本管理，脚本位于 shana-infrastructure/src/main/resources/db/migration
+  # 临时想跳过迁移（例如只想跑一次离线演示）时设 FLYWAY_ENABLED=false
+  flyway:
+    enabled: ${FLYWAY_ENABLED:true}
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2s
+      connect-timeout: 2s
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    banner: false
+
+shana:
+  # 由 Maven 资源过滤注入（spring-boot-starter-parent 对 application*.yml 生效）
+  version: @project.version@
+  memory:
+    # 上下文存储：jdbc（PostgreSQL，默认）/ memory（进程内，测试与离线演示用）
+    store: ${SHANA_MEMORY_STORE:jdbc}
+    # 单个群聊一次对话读取（喂给模型）的最近消息条数；只影响读取，不删除历史
+    max-messages: 20
+  llm:
+    # 使用哪一类模型来源，决定 LlmClientRegistry 里选哪个适配器
+    provider: ${SHANA_LLM_PROVIDER:OPENAI_COMPATIBLE}
+    openai-compatible:
+      # OpenAI / DeepSeek / 通义 / 本地 vLLM 都兼容该协议，换厂商只改下面三行
+      base-url: ${SHANA_LLM_BASE_URL:https://api.deepseek.com/v1}
+      model: ${SHANA_LLM_MODEL:deepseek-chat}
+      # 没有 key 时适配器不会装配，接口返回“服务暂不可用”，但工程仍能正常启动
+      api-key: ${SHANA_LLM_API_KEY:}
+      temperature: ${SHANA_LLM_TEMPERATURE:0.7}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+  # 数据库已接入会话持久化，健康检查随之打开：连不上时 Actuator 会如实报 DOWN
+  # Redis 仍未接入业务，保持关闭，避免本地没装 Redis 时误报
+  health:
+    db:
+      enabled: true
+    redis:
+      enabled: false
+
+logging:
+  level:
+    root: info
+    com.shana: info
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"

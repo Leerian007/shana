@@ -1,0 +1,21 @@
+# 开发环境配置：默认 profile，本地直接 mvn spring-boot:run 即生效
+spring:
+  config:
+    activate:
+      on-profile: dev
+
+logging:
+  level:
+    com.shana: debug
+    org.springframework.web.servlet.mvc: info
+
+management:
+  endpoint:
+    health:
+      show-details: always
+
+# 模型配置统一放在 application.yml，用环境变量覆盖即可，例如：
+#   export SHANA_LLM_API_KEY=sk-xxx
+#   export SHANA_LLM_BASE_URL=https://api.deepseek.com/v1
+#   export SHANA_LLM_MODEL=deepseek-chat
+# 注意不要在这里写空的 api-key:，YAML 空值会覆盖掉默认配置。
