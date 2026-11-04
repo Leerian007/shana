@@ -20,6 +20,17 @@ spring:
       max-file-size: 20MB
       max-request-size: 20MB
 
+  # 异步任务线程池：目前只有长期记忆摘要会用到。
+  # 队列刻意给得不大——摘要任务堆积说明上游模型慢，继续收只会让延迟雪崩；
+  # 队列满时提交会失败，由调用方吞掉，摘要游标未推进，下次对话会重新触发。
+  task:
+    execution:
+      thread-name-prefix: shana-async-
+      pool:
+        core-size: 2
+        max-size: 4
+        queue-capacity: 200
+
   # 数据库已成为会话持久化的必需依赖：Hikari 在首次真正取连接时才建连，
   # initialization-fail-timeout = -1 让"连接池初始化"不阻塞启动，
   # 但 Flyway 迁移会在启动期真正连库，数据库不可用时应用会明确失败（比带病运行好排查）。
@@ -66,6 +77,13 @@ shana:
     max-messages: 20
     # 仅 store=redis 生效：会话在 Redis 中的存活时间，每次写入都会续期
     ttl: ${SHANA_MEMORY_TTL:24h}
+    # 长期记忆（对话摘要 + 关键信息抽取）只在 store=jdbc 下生效：
+    # 没有完整历史就无从摘要，Redis/内存模式会自动跳过，不影响问答
+    summary:
+      # 未消化的消息攒够多少条才触发一次摘要。太小会让模型调用过于频繁，太大则记忆滞后
+      trigger-messages: ${SHANA_MEMORY_SUMMARY_TRIGGER:20}
+      # 单次喂给模型的原文上限，超出的部分下一轮继续消化（摘要游标会推进）
+      batch-size: ${SHANA_MEMORY_SUMMARY_BATCH:50}
   llm:
     # 使用哪一类模型来源，决定 LlmClientRegistry 里选哪个适配器
     provider: ${SHANA_LLM_PROVIDER:OPENAI_COMPATIBLE}

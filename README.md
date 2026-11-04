@@ -5,8 +5,8 @@
 
 当前已完成：工程骨架（分层结构、统一响应、异常处理、健康检查、本地基础设施编排）、
 OpenAI 兼容协议的模型适配层、`POST /api/v1/chat` 问答链路、基于 PostgreSQL 的会话持久化、
-以及可切换的 Redis 上下文。
-**尚未实现**长期记忆、RAG、Agent 循环与群成员画像。
+可切换的 Redis 上下文，以及**长期记忆**（滚动摘要 + 关键信息抽取）。
+**尚未实现** RAG、Agent 循环与群成员画像。
 
 ---
 
@@ -97,19 +97,25 @@ shana/
 │       ├── LlmClient.java      # 统一模型调用接口
 │       ├── LlmClientRegistry.java
 │       ├── ChatMessage.java / ChatRequest.java / ChatResponse.java
-│       └── adapter/            # 适配实现（当前为空，仅存放 package-info 说明）
+│       └── adapter/            # OpenAI 兼容协议适配（DTO、Mapper、Client、条件装配）
 │
 ├── shana-core/
 │   └── src/main/java/com/shana/core/
+│       ├── chat/               # 问答编排：ChatService、ChatReply
+│       ├── memory/             # 长期记忆编排：摘要生成、结果解析、prompt 渲染
 │       └── health/             # 核心服务示例：SystemHealthService
 │
 ├── shana-infrastructure/
 │   └── src/main/java/com/shana/infrastructure/
-│       └── config/MybatisPlusConfig.java
+│       ├── config/             # MyBatis-Plus 配置
+│       └── persistence/        # 上下文 / 长期记忆 / 归档实现，实体与 Mapper
 │
 ├── shana-memory/
 │   └── src/main/java/com/shana/memory/
-│       ├── ConversationMemory.java
+│       ├── ConversationMemory.java          # 短期上下文端口（窗口）
+│       ├── LongTermMemory.java              # 长期记忆端口（摘要 + 事实）
+│       ├── ConversationArchive.java         # 历史归档端口（按游标扫描原文）
+│       ├── MemorySnapshot.java / MemoryFact.java / FactKind.java
 │       └── InMemoryConversationMemory.java
 │
 ├── shana-agent/
@@ -119,8 +125,8 @@ shana/
 │
 ├── shana-api/
 │   └── src/main/java/com/shana/api/
-│       ├── controller/HealthController.java
-│       ├── vo/HealthVO.java
+│       ├── controller/         # HealthController、ChatController
+│       ├── dto/ vo/            # 请求体与响应体
 │       └── handler/GlobalExceptionHandler.java
 │
 └── shana-application/
@@ -273,6 +279,9 @@ curl http://localhost:8080/actuator/health
 > 手动联调（启动应用 + 发消息 + 查表 / `redis-cli LRANGE`）负责剩下的部分。
 > `RedisMemoryWiringTest` 单独验证 `store=redis` 时装配的是 Redis 实现，
 > 不会和 JDBC、内存实现同时在场。
+> 长期记忆拆成三段测：`SummaryDraftParserTest`（模型返回的各种不听话）、
+> `MemoryPromptRendererTest`（拼进 prompt 的样子）、`ConversationSummarizerTest`（何时触发、并发丢弃、失败不抛）。
+> `@Async` 在真实容器里的线程切换没有自动化覆盖，靠手动联调观察日志。
 
 日常只需：
 
@@ -318,6 +327,7 @@ mvn -pl shana-application test -Dtest=LiveChatSmokeTest
 
 - `shana-infrastructure/src/main/resources/db/migration/V1__create_chat_message.sql`
 - `shana-infrastructure/src/main/resources/db/migration/V2__add_sender_id_to_chat_message.sql`
+- `shana-infrastructure/src/main/resources/db/migration/V3__create_long_term_memory.sql`（`conversation_summary` + `memory_fact`，见下方「长期记忆」）
 
 ```
 chat_message
@@ -352,6 +362,9 @@ chat_message
 | `jdbc`（默认） | `JdbcConversationMemory` | PostgreSQL，**全量历史** | 正常运行、需要事后分析 |
 | `redis` | `RedisConversationMemory` | Redis LIST，**只留窗口内最近 N 条** | 多实例部署、上下文热数据 |
 | `memory` | `InMemoryConversationMemory` | 进程堆内存 | 单元测试、离线演示 |
+
+> 长期记忆（摘要 + 事实）只在 `jdbc` 下可用：`redis` / `memory` 模式没有完整历史，
+> 相关 Bean 不会装配，问答链路照常工作，只是没有跨窗口记忆。
 
 ```bash
 # 用 Redis 存上下文（多实例共享）。此时消息不再落库；
@@ -397,6 +410,88 @@ FROM chat_message
 WHERE conversation_id = 'group-1' AND sender_id IS NOT NULL
 GROUP BY sender_id ORDER BY messages DESC;
 ```
+
+---
+
+## 长期记忆：对话摘要与关键信息
+
+上面解决的是"最近 20 条"，这一段解决"上周聊过什么"。两层记忆分工明确：
+
+| 层 | 存什么 | 生命周期 | 谁在用 |
+| --- | --- | --- | --- |
+| 短期上下文 | 最近 `max-messages` 条原文 | 随窗口滚动 | 每次对话，逐字接话 |
+| 长期记忆 | 滚动摘要 + 关键信息条目 | 长期累积 | 每次对话拼进 prompt；离线分析 |
+
+### 两张表
+
+```sql
+conversation_summary                 -- 一个群一版，主键即 conversation_id
+├── summary             TEXT         -- 滚动摘要，300 字以内
+└── covered_message_id  BIGINT       -- 已消化到哪条消息（游标 + 乐观锁）
+
+memory_fact                          -- 追加式事实条目
+├── kind      VARCHAR(16)            -- PERSON / PREFERENCE / DECISION / FACT
+├── subject   VARCHAR(64)            -- 主体，通常是人名；无主体时为空串
+├── content   VARCHAR(200)           -- 一句话事实
+└── source_message_id BIGINT         -- 来自哪条消息，便于回查
+
+UNIQUE (conversation_id, kind, subject, content)   -- 重复抽取自动被挡掉
+```
+
+**为什么摘要之外还要事实表**：摘要是有损压缩，滚动几次之后早期细节必然消失。
+关键信息是追加式的、不参与滚动，所以"张三在学 Flink"不会因为后面聊了几百句就蒸发。
+
+### 触发流程
+
+```
+POST /api/v1/chat
+  → 写消息、读上下文、调模型、回写回复      （主链路，用户已拿到回复）
+  → 提交后台任务（@Async，不阻塞、失败不影响回复）
+        ├─ 未消化消息 < trigger-messages(20)？  → 直接返回
+        ├─ 取游标之后的 batch-size(50) 条原文
+        ├─ 调模型：已有摘要 + 新对话 → {summary, facts}
+        ├─ 乐观更新游标（WHERE covered_message_id = 旧值）
+        └─ 成功才写事实；游标没推进说明别的实例先做了，本次结果丢弃
+```
+
+### 四个设计取舍
+
+1. **增量而不是全量重算。** 每次只喂"旧摘要 + 新一批消息"。全量重算更准，但成本随对话量线性涨，
+   活跃群跑两周就喂不进上下文了。
+2. **游标即乐观锁。** 多实例同时摘要同一个群时，只有把 `covered_message_id` 推进成功的那一个写库。
+   代价是偶尔白跑一次模型调用，远好过旧摘要覆盖新摘要。
+3. **失败绝不影响主链路。** 模型超时、返回坏 JSON、队列满，都只记日志。
+   游标没动，下次对话会重新触发，不会丢数据。
+4. **只依赖持久化存储。** Redis / 内存模式下没有完整历史，摘要不成立，
+   相关 Bean 不会装配，链路照常工作（只是没有跨窗口记忆）。这是刻意的约束，不是遗漏。
+
+### prompt 里的位置
+
+```
+[system] 你是 Shana……
+[system] 【群聊长期记忆】摘要：…… / 已知信息：- 张三：在学 Flink
+[user]   那 checkpoint 呢
+[assistant] ……
+```
+
+长期记忆单独占一条 system，不拼进人设：摘要每次都会变，混在一起会让"助手是谁"
+和"助手记得什么"缠成一团，也不好按需整段丢弃。事实最多取最新 10 条，避免稀释相关性。
+
+### 验证
+
+```sql
+SELECT conversation_id, left(summary, 60), covered_message_id FROM conversation_summary;
+SELECT kind, subject, content FROM memory_fact WHERE conversation_id = 'group-1' ORDER BY id DESC;
+```
+
+日志里会看到：`群聊 group-1 的长期记忆已更新：覆盖到消息 42，新增事实 3 条`。
+
+相关配置：
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `shana.memory.summary.trigger-messages` | 20 | 攒够多少条未消化消息才触发 |
+| `shana.memory.summary.batch-size` | 50 | 单次喂给模型的原文上限 |
 
 ---
 
@@ -604,7 +699,8 @@ Maven 用错了 JDK（看 `mvn -v` 输出的 Java version）。设置 `JAVA_HOME
 4. ~~**Redis 会话状态**：多实例共享上下文，替换 `InMemoryConversationMemory`~~
    ✅ 已完成（`SHANA_MEMORY_STORE=redis`；只承载窗口内的热上下文，全量历史仍由 PostgreSQL 负责）；
    待补：Redis + PostgreSQL 的组合实现（缓存回源，兼顾共享与存档）。
-5. **长期记忆**：对话摘要 + 关键信息抽取。
+5. ~~**长期记忆**：对话摘要 + 关键信息抽取~~ ✅ 已完成（滚动摘要 + 追加式事实，异步、乐观并发）；
+   待补：按相关性检索事实、摘要的定期重压缩（防止反复滚动后失真累积）。
 6. **RAG**：文档切分、Embedding、向量检索（PostgreSQL pgvector 或独立向量库）。
 7. **Agent / Tool Calling**：基于 `Tool` 扩展点实现单轮工具调用，再演进到多轮编排。
 8. **群聊分析与月度总结**：批量任务 + 报表输出。

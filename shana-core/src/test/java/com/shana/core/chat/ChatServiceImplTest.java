@@ -2,7 +2,12 @@ package com.shana.core.chat;
 
 import com.shana.common.api.ErrorCode;
 import com.shana.common.exception.BusinessException;
+import com.shana.core.memory.ConversationSummarizer;
 import com.shana.memory.ConversationMemory;
+import com.shana.memory.FactKind;
+import com.shana.memory.LongTermMemory;
+import com.shana.memory.MemoryFact;
+import com.shana.memory.MemorySnapshot;
 import com.shana.model.ChatMessage;
 import com.shana.model.ChatRequest;
 import com.shana.model.ChatResponse;
@@ -16,8 +21,11 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
+import org.springframework.beans.factory.ObjectProvider;
 
+import java.util.Iterator;
 import java.util.List;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -26,6 +34,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.BDDMockito.given;
+import static org.mockito.BDDMockito.willThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -34,7 +43,7 @@ import static org.mockito.Mockito.verify;
 /**
  * 编排逻辑测试：记忆和模型都用 Mockito 替身，不碰真实存储、不发网络请求。
  *
- * <p>重点验证三件事：prompt 的组装顺序、上下文何时写入、失败时留下什么痕迹。
+ * <p>重点验证四件事：prompt 的组装顺序、长期记忆的位置、上下文何时写入、失败时留下什么痕迹。
  */
 class ChatServiceImplTest {
 
@@ -51,7 +60,7 @@ class ChatServiceImplTest {
         llmClient = mock(LlmClient.class);
         registry = mock(LlmClientRegistry.class);
         given(registry.get(LlmProvider.OPENAI_COMPATIBLE)).willReturn(llmClient);
-        chatService = new ChatServiceImpl(memory, registry, LlmProvider.OPENAI_COMPATIBLE);
+        chatService = new ChatServiceImpl(memory, registry, absent(), absent(), LlmProvider.OPENAI_COMPATIBLE);
     }
 
     @Test
@@ -143,5 +152,131 @@ class ChatServiceImplTest {
 
         verify(memory).append(eq(CONVERSATION_ID), argThat(message -> message.role() == ChatRole.USER));
         verify(memory, never()).append(anyString(), argThat(message -> message.role() == ChatRole.ASSISTANT));
+    }
+
+    @Test
+    @DisplayName("有长期记忆时作为独立 system 消息插在历史之前")
+    void shouldInjectLongTermMemoryBeforeHistory() {
+        LongTermMemory longTermMemory = mock(LongTermMemory.class);
+        given(longTermMemory.load(CONVERSATION_ID, 10)).willReturn(new MemorySnapshot(
+                "群里在讨论 Flink 的状态后端",
+                5L,
+                List.of(MemoryFact.of(FactKind.PERSON, "张三", "在学 Flink"))));
+        chatService = new ChatServiceImpl(memory, registry, present(longTermMemory), absent(),
+                LlmProvider.OPENAI_COMPATIBLE);
+
+        given(memory.history(CONVERSATION_ID)).willReturn(List.of(ChatMessage.user("那 checkpoint 呢")));
+        given(llmClient.chat(any())).willReturn(
+                new ChatResponse("可以用 RocksDB", LlmProvider.OPENAI_COMPATIBLE, "test-model", TokenUsage.unknown()));
+
+        chatService.reply(CONVERSATION_ID, "那 checkpoint 呢");
+
+        ArgumentCaptor<ChatRequest> captor = ArgumentCaptor.forClass(ChatRequest.class);
+        verify(llmClient).chat(captor.capture());
+        List<ChatMessage> sent = captor.getValue().messages();
+
+        // 人设 → 长期记忆 → 历史：记忆必须落在历史之前，否则模型会把它当成"刚刚发生的事"
+        assertThat(sent).hasSize(3);
+        assertThat(sent.get(1).role()).isEqualTo(ChatRole.SYSTEM);
+        assertThat(sent.get(1).content()).contains("张三", "Flink", "状态后端");
+        assertThat(sent.get(2).content()).isEqualTo("那 checkpoint 呢");
+    }
+
+    @Test
+    @DisplayName("没有任何记忆时不额外插入空的 system 段落")
+    void shouldNotInjectEmptyMemoryBlock() {
+        LongTermMemory longTermMemory = mock(LongTermMemory.class);
+        given(longTermMemory.load(CONVERSATION_ID, 10)).willReturn(MemorySnapshot.empty());
+        chatService = new ChatServiceImpl(memory, registry, present(longTermMemory), absent(),
+                LlmProvider.OPENAI_COMPATIBLE);
+
+        given(memory.history(CONVERSATION_ID)).willReturn(List.of(ChatMessage.user("你好")));
+        given(llmClient.chat(any())).willReturn(
+                new ChatResponse("你好", LlmProvider.OPENAI_COMPATIBLE, "test-model", TokenUsage.unknown()));
+
+        chatService.reply(CONVERSATION_ID, "你好");
+
+        ArgumentCaptor<ChatRequest> captor = ArgumentCaptor.forClass(ChatRequest.class);
+        verify(llmClient).chat(captor.capture());
+        assertThat(captor.getValue().messages()).hasSize(2);
+    }
+
+    @Test
+    @DisplayName("回复成功后触发一次后台摘要")
+    void shouldTriggerSummaryAfterReply() {
+        ConversationSummarizer summarizer = mock(ConversationSummarizer.class);
+        chatService = new ChatServiceImpl(memory, registry, absent(), present(summarizer),
+                LlmProvider.OPENAI_COMPATIBLE);
+
+        given(memory.history(CONVERSATION_ID)).willReturn(List.of(ChatMessage.user("你好")));
+        given(llmClient.chat(any())).willReturn(
+                new ChatResponse("你好", LlmProvider.OPENAI_COMPATIBLE, "test-model", TokenUsage.unknown()));
+
+        chatService.reply(CONVERSATION_ID, "你好");
+
+        verify(summarizer).summarizeAsync(CONVERSATION_ID);
+    }
+
+    @Test
+    @DisplayName("摘要任务提交失败不影响本次回复")
+    void shouldSurviveSummarySchedulingFailure() {
+        ConversationSummarizer summarizer = mock(ConversationSummarizer.class);
+        willThrow(new IllegalStateException("队列满了")).given(summarizer).summarizeAsync(CONVERSATION_ID);
+        chatService = new ChatServiceImpl(memory, registry, absent(), present(summarizer),
+                LlmProvider.OPENAI_COMPATIBLE);
+
+        given(memory.history(CONVERSATION_ID)).willReturn(List.of(ChatMessage.user("你好")));
+        given(llmClient.chat(any())).willReturn(
+                new ChatResponse("你好", LlmProvider.OPENAI_COMPATIBLE, "test-model", TokenUsage.unknown()));
+
+        ChatReply reply = chatService.reply(CONVERSATION_ID, "你好");
+
+        assertThat(reply.content()).isEqualTo("你好");
+    }
+
+    /** 模拟容器里没有这个 Bean 的情况（Redis / 内存模式下长期记忆不存在）。 */
+    @SuppressWarnings("unchecked")
+    private static <T> ObjectProvider<T> absent() {
+        ObjectProvider<T> provider = mock(ObjectProvider.class);
+        given(provider.getIfAvailable()).willReturn(null);
+        return provider;
+    }
+
+    private static <T> ObjectProvider<T> present(T bean) {
+        return new FixedObjectProvider<>(bean);
+    }
+
+    /** 只关心"有没有 Bean"的最小 ObjectProvider，避免为一个测试写一堆无意义的 stub。 */
+    private record FixedObjectProvider<T>(T bean) implements ObjectProvider<T> {
+
+        @Override
+        public T getObject() {
+            return bean;
+        }
+
+        @Override
+        public T getObject(Object... args) {
+            return bean;
+        }
+
+        @Override
+        public T getIfAvailable() {
+            return bean;
+        }
+
+        @Override
+        public T getIfUnique() {
+            return bean;
+        }
+
+        @Override
+        public Iterator<T> iterator() {
+            return List.of(bean).iterator();
+        }
+
+        @Override
+        public Stream<T> stream() {
+            return Stream.of(bean);
+        }
     }
 }
