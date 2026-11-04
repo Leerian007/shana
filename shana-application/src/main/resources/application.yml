@@ -60,10 +60,12 @@ shana:
   # 由 Maven 资源过滤注入（spring-boot-starter-parent 对 application*.yml 生效）
   version: @project.version@
   memory:
-    # 上下文存储：jdbc（PostgreSQL，默认）/ memory（进程内，测试与离线演示用）
+    # 上下文存储：jdbc（PostgreSQL，默认，保留全量历史）/ redis（多实例共享的热窗口）/ memory（进程内，测试与离线演示用）
     store: ${SHANA_MEMORY_STORE:jdbc}
     # 单个群聊一次对话读取（喂给模型）的最近消息条数；只影响读取，不删除历史
     max-messages: 20
+    # 仅 store=redis 生效：会话在 Redis 中的存活时间，每次写入都会续期
+    ttl: ${SHANA_MEMORY_TTL:24h}
   llm:
     # 使用哪一类模型来源，决定 LlmClientRegistry 里选哪个适配器
     provider: ${SHANA_LLM_PROVIDER:OPENAI_COMPATIBLE}
@@ -84,12 +86,13 @@ management:
     health:
       show-details: never
   # 数据库已接入会话持久化，健康检查随之打开：连不上时 Actuator 会如实报 DOWN
-  # Redis 仍未接入业务，保持关闭，避免本地没装 Redis 时误报
+  # Redis 只在 SHANA_MEMORY_STORE=redis 时才是必需依赖，默认关闭这项检查，
+  # 避免 jdbc 模式下因为本机没装 Redis 而误报 DOWN；切到 redis 模式后设 SHANA_REDIS_HEALTH=true
   health:
     db:
       enabled: true
     redis:
-      enabled: false
+      enabled: ${SHANA_REDIS_HEALTH:false}
 
 logging:
   level:

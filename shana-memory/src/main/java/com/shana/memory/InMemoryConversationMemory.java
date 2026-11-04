@@ -17,7 +17,9 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>每个会话只保留最近 {@code shana.memory.max-messages} 条消息：
  * 群聊消息量大，无限制累积会让 prompt 迅速超出上下文窗口并推高成本。
- * <p>注意：进程重启后数据丢失，多实例部署时各实例不共享。
+ * <p>注意：进程重启后数据丢失，多实例部署时各实例不共享——同一个群在两个实例上
+ * 会看到两份互不相干的上下文。需要跨实例共享时用 {@code RedisConversationMemory}
+ * （{@code shana.memory.store=redis}）。
  * 默认走 PostgreSQL 实现（{@code JdbcConversationMemory}），
  * 只有显式配置 {@code shana.memory.store=memory} 时才会启用本类——
  * 单元测试、离线演示、以及数据库暂时不可用时用得上。

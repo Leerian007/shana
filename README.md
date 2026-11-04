@@ -4,7 +4,8 @@
 接入云端 / 本地 / 自建微调模型，管理群聊上下文与长期记忆，支持 RAG、Agent 与工具调用。
 
 当前已完成：工程骨架（分层结构、统一响应、异常处理、健康检查、本地基础设施编排）、
-OpenAI 兼容协议的模型适配层、`POST /api/v1/chat` 问答链路、以及基于 PostgreSQL 的会话持久化。
+OpenAI 兼容协议的模型适配层、`POST /api/v1/chat` 问答链路、基于 PostgreSQL 的会话持久化、
+以及可切换的 Redis 上下文。
 **尚未实现**长期记忆、RAG、Agent 循环与群成员画像。
 
 ---
@@ -21,7 +22,7 @@ OpenAI 兼容协议的模型适配层、`POST /api/v1/chat` 问答链路、以�
 | 监控 | Spring Boot Actuator | 由 BOM 管理 | `/actuator/health`、`/actuator/info` |
 | 数据访问 | MyBatis-Plus | 3.5.18 | `mybatis-plus-spring-boot3-starter` |
 | 数据库 | PostgreSQL | 17 | 本地由 Docker Compose 提供 |
-| 缓存 | Redis | 7 | 后续用于会话状态与缓存 |
+| 缓存 | Redis | 7 | 会话上下文热窗口（多实例共享），可切换启用 |
 | 容器 | Docker / Docker Compose | 任意较新版本 | 仅用于本地中间件 |
 | 测试 | JUnit 5 + Mockito + AssertJ | 由 BOM 管理 | 单元测试 + MockMvc 集成测试 |
 | 工具 | Lombok | 由 BOM 管理 | 仅用于 `@Slf4j`、`@Getter`、`@RequiredArgsConstructor` |
@@ -38,7 +39,7 @@ OpenAI 兼容协议的模型适配层、`POST /api/v1/chat` 问答链路、以�
 | `shana-common` | 统一响应 `Result`、错误码 `ErrorCode`、业务异常 `BusinessException` | 无 |
 | `shana-model` | 统一模型调用入口 `LlmClient`、消息/请求/响应模型、`LlmClientRegistry` 路由 | common |
 | `shana-core` | 核心业务接口与领域模型，编排模型/记忆/工具 | common, model, memory |
-| `shana-infrastructure` | 数据访问（MyBatis-Plus + PostgreSQL）、Flyway 迁移、`ConversationMemory` 的数据库实现、Redis 客户端 | common, core, memory |
+| `shana-infrastructure` | 数据访问（MyBatis-Plus + PostgreSQL）、Flyway 迁移、`ConversationMemory` 的数据库/Redis 实现 | common, core, memory |
 | `shana-memory` | 群聊上下文与长期记忆管理 | common, model |
 | `shana-agent` | Agent 循环、工具调用、任务编排（当前仅工具扩展点） | common, model |
 | `shana-api` | Controller、VO、全局异常处理 | common, core |
@@ -265,9 +266,13 @@ curl http://localhost:8080/actuator/health
 
 > 集成测试统一跑在 `test` profile 下（`@ActiveProfiles("test")`），
 > 该 profile 把会话存储切回内存实现并关闭 Flyway，
-> 所以 `mvn test` 不需要本机有 PostgreSQL。
-> 数据库行为由 `JdbcConversationMemoryTest`（Mock 验证生成的 SQL 语义）
-> 和手动联调（启动应用 + 发消息 + 查表）覆盖。
+> 所以 `mvn test` 不需要本机有 PostgreSQL，也不需要 Redis。
+> 数据库行为由 `JdbcConversationMemoryTest`（Mock 验证生成的 SQL 语义）、
+> Redis 行为由 `RedisConversationMemoryTest`（Mock 验证发出的命令序列）与
+> `ChatMessageCodecTest`（编解码往返）覆盖；
+> 手动联调（启动应用 + 发消息 + 查表 / `redis-cli LRANGE`）负责剩下的部分。
+> `RedisMemoryWiringTest` 单独验证 `store=redis` 时装配的是 Redis 实现，
+> 不会和 JDBC、内存实现同时在场。
 
 日常只需：
 
@@ -340,17 +345,41 @@ chat_message
 
 ### 实现切换
 
-`ConversationMemory` 接口有两个实现，通过配置二选一：
+`ConversationMemory` 有三个实现，通过 `shana.memory.store` 三选一（互斥装配）：
 
-| 配置 | 实现 | 场景 |
-| --- | --- | --- |
-| `shana.memory.store=jdbc`（默认） | `JdbcConversationMemory` | 正常运行 |
-| `shana.memory.store=memory` | `InMemoryConversationMemory` | 单元测试、离线演示 |
+| 配置 | 实现 | 数据位置 | 场景 |
+| --- | --- | --- | --- |
+| `jdbc`（默认） | `JdbcConversationMemory` | PostgreSQL，**全量历史** | 正常运行、需要事后分析 |
+| `redis` | `RedisConversationMemory` | Redis LIST，**只留窗口内最近 N 条** | 多实例部署、上下文热数据 |
+| `memory` | `InMemoryConversationMemory` | 进程堆内存 | 单元测试、离线演示 |
 
 ```bash
-# 临时不连数据库跑一次（配合 FLYWAY_ENABLED=false）
+# 用 Redis 存上下文（多实例共享）。此时消息不再落库；
+# 本机没有 PostgreSQL 时加 FLYWAY_ENABLED=false 跳过迁移，否则启动期会连库失败
+SHANA_MEMORY_STORE=redis FLYWAY_ENABLED=false mvn -pl shana-application spring-boot:run
+
+# 完全离线：不连库也不连 Redis
 SHANA_MEMORY_STORE=memory FLYWAY_ENABLED=false mvn -pl shana-application spring-boot:run
 ```
+
+### Redis 会话上下文
+
+启用 `store=redis` 后，每个群聊对应一个 key：`shana:chat:{conversationId}`，
+结构是 LIST，新消息 `LPUSH` 到头部、`LTRIM` 裁到 `shana.memory.max-messages` 条，
+每次写入刷新 `shana.memory.ttl`（默认 `24h`）。读的时候反向遍历即时间正序。
+
+三个必须知道的取舍：
+
+1. **Redis 只存热窗口，不是历史存档。** 会话冷下来就会过期，超出窗口的消息直接丢弃。
+   需要长期保留、按人统计、做月度总结的全量消息仍然只有 `jdbc` 实现会落库。
+   换句话说：**Redis 替代的是 `memory` 的"上下文"角色，不能替代 PostgreSQL 的"存档"角色**。
+2. **不做静默降级。** Redis 连不上时 `append` / `history` 直接抛异常，接口返回 503。
+   这比"悄悄丢掉上下文、助手答得莫名其妙"更容易排查。
+3. **写入不是事务。** `LPUSH`、`LTRIM`、`EXPIRE` 三条命令顺序执行，并发时最坏多留几条，
+   下一次 `LTRIM` 会裁掉；为此上 Lua 脚本不划算。TTL 放在最后，避免留下永不过期的 key。
+
+> 想同时要"多实例共享"和"全量落库"，需要一个"Redis 缓存 + PostgreSQL 回源"的组合实现，
+> 属于独立的一步，当前未做——`store` 仍是三选一，不是叠加。
 
 ### 验证数据是否落库
 
@@ -409,8 +438,10 @@ REDIS_HOST REDIS_PORT REDIS_PASSWORD
 SERVER_PORT
 ```
 
-> 注意：数据库已接入会话持久化，`management.health.db` 已开启，连不上时 Actuator 会如实报 `DOWN`；
-> Redis 仍未接入业务，保持关闭，避免本地没装 Redis 时误报。
+> 注意：数据库已接入会话持久化，`management.health.db` 已开启，连不上时 Actuator 会如实报 `DOWN`。
+> Redis 只在 `SHANA_MEMORY_STORE=redis` 时才是必需依赖，因此 `management.health.redis` 默认关闭，
+> 避免默认的 `jdbc` 模式下本机没装 Redis 却报 `DOWN`。切到 Redis 模式后设
+> `SHANA_REDIS_HEALTH=true` 打开这项检查。
 
 ---
 
@@ -570,7 +601,9 @@ Maven 用错了 JDK（看 `mvn -v` 输出的 Java version）。设置 `JAVA_HOME
 2. ~~**群聊对话链路**：`ChatService` 编排"组装 system prompt + 取上下文 + 调模型 + 回写上下文"，
    对外提供 `POST /api/v1/chat`~~ ✅ 已完成。
 3. ~~**持久化**：建表 + Flyway 迁移 + MyBatis-Plus Mapper，把上下文与消息落到 PostgreSQL~~ ✅ 已完成。
-4. **Redis 会话状态**：多实例共享上下文，替换 `InMemoryConversationMemory`。
+4. ~~**Redis 会话状态**：多实例共享上下文，替换 `InMemoryConversationMemory`~~
+   ✅ 已完成（`SHANA_MEMORY_STORE=redis`；只承载窗口内的热上下文，全量历史仍由 PostgreSQL 负责）；
+   待补：Redis + PostgreSQL 的组合实现（缓存回源，兼顾共享与存档）。
 5. **长期记忆**：对话摘要 + 关键信息抽取。
 6. **RAG**：文档切分、Embedding、向量检索（PostgreSQL pgvector 或独立向量库）。
 7. **Agent / Tool Calling**：基于 `Tool` 扩展点实现单轮工具调用，再演进到多轮编排。
