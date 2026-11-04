@@ -5,8 +5,9 @@
 
 当前已完成：工程骨架（分层结构、统一响应、异常处理、健康检查、本地基础设施编排）、
 OpenAI 兼容协议的模型适配层、`POST /api/v1/chat` 问答链路、基于 PostgreSQL 的会话持久化、
-可切换的 Redis 上下文，以及**长期记忆**（滚动摘要 + 关键信息抽取）。
-**尚未实现** RAG、Agent 循环与群成员画像。
+可切换的 Redis 上下文、长期记忆（滚动摘要 + 关键信息抽取），
+以及 **RAG**（文档切分 + Embedding + pgvector 向量检索）。
+**尚未实现** Agent 循环与群成员画像。
 
 ---
 
@@ -22,6 +23,7 @@ OpenAI 兼容协议的模型适配层、`POST /api/v1/chat` 问答链路、基�
 | 监控 | Spring Boot Actuator | 由 BOM 管理 | `/actuator/health`、`/actuator/info` |
 | 数据访问 | MyBatis-Plus | 3.5.18 | `mybatis-plus-spring-boot3-starter` |
 | 数据库 | PostgreSQL | 17 | 本地由 Docker Compose 提供 |
+| 向量存储 | pgvector | 0.7+ | PostgreSQL 扩展，HNSW 索引 + 余弦距离 |
 | 缓存 | Redis | 7 | 会话上下文热窗口（多实例共享），可切换启用 |
 | 容器 | Docker / Docker Compose | 任意较新版本 | 仅用于本地中间件 |
 | 测试 | JUnit 5 + Mockito + AssertJ | 由 BOM 管理 | 单元测试 + MockMvc 集成测试 |
@@ -37,12 +39,13 @@ OpenAI 兼容协议的模型适配层、`POST /api/v1/chat` 问答链路、基�
 | 模块 | 职责 | 依赖 |
 | --- | --- | --- |
 | `shana-common` | 统一响应 `Result`、错误码 `ErrorCode`、业务异常 `BusinessException` | 无 |
-| `shana-model` | 统一模型调用入口 `LlmClient`、消息/请求/响应模型、`LlmClientRegistry` 路由 | common |
-| `shana-core` | 核心业务接口与领域模型，编排模型/记忆/工具 | common, model, memory |
-| `shana-infrastructure` | 数据访问（MyBatis-Plus + PostgreSQL）、Flyway 迁移、`ConversationMemory` 的数据库/Redis 实现 | common, core, memory |
+| `shana-model` | 统一模型调用入口 `LlmClient`、`EmbeddingClient`、消息/请求/响应模型、`LlmClientRegistry` 路由 | common |
+| `shana-rag` | RAG 领域层：文档切分、知识库编排、向量存储端口 | common, model |
+| `shana-core` | 核心业务接口与领域模型，编排模型/记忆/知识库/工具 | common, model, memory, rag |
+| `shana-infrastructure` | 数据访问（MyBatis-Plus + PostgreSQL）、Flyway 迁移、`ConversationMemory` 与 `VectorStore` 的实现 | common, core, memory, rag |
 | `shana-memory` | 群聊上下文与长期记忆管理 | common, model |
 | `shana-agent` | Agent 循环、工具调用、任务编排（当前仅工具扩展点） | common, model |
-| `shana-api` | Controller、VO、全局异常处理 | common, core |
+| `shana-api` | Controller、VO、全局异常处理 | common, core, rag |
 | `shana-application` | 装配所有模块，提供启动类与配置，唯一的可执行 jar | 全部模块 |
 
 依赖图（`──▶` 表示"依赖"，箭头指向被依赖方）：
@@ -94,10 +97,17 @@ shana/
 │
 ├── shana-model/
 │   └── src/main/java/com/shana/model/
-│       ├── LlmClient.java      # 统一模型调用接口
+│       ├── LlmClient.java / EmbeddingClient.java   # 对话与向量化两个独立入口
 │       ├── LlmClientRegistry.java
 │       ├── ChatMessage.java / ChatRequest.java / ChatResponse.java
-│       └── adapter/            # OpenAI 兼容协议适配（DTO、Mapper、Client、条件装配）
+│       └── adapter/            # OpenAI 兼容协议适配（对话 + embeddings）
+│
+├── shana-rag/
+│   └── src/main/java/com/shana/rag/
+│       ├── KnowledgeBase.java / KnowledgeBaseImpl.java   # 知识库编排
+│       ├── TextSplitter.java                             # 文档切分
+│       ├── KnowledgePromptRenderer.java                  # 检索结果渲染成 system 消息
+│       └── store/              # VectorStore 端口、检索结果、待入库片段
 │
 ├── shana-core/
 │   └── src/main/java/com/shana/core/
@@ -107,8 +117,8 @@ shana/
 │
 ├── shana-infrastructure/
 │   └── src/main/java/com/shana/infrastructure/
-│       ├── config/             # MyBatis-Plus 配置
-│       └── persistence/        # 上下文 / 长期记忆 / 归档实现，实体与 Mapper
+│       ├── config/             # MyBatis-Plus 配置、知识库装配
+│       └── persistence/        # 上下文 / 长期记忆 / 知识库实现，实体与 Mapper
 │
 ├── shana-memory/
 │   └── src/main/java/com/shana/memory/
@@ -125,7 +135,7 @@ shana/
 │
 ├── shana-api/
 │   └── src/main/java/com/shana/api/
-│       ├── controller/         # HealthController、ChatController
+│       ├── controller/         # HealthController、ChatController、KnowledgeController
 │       ├── dto/ vo/            # 请求体与响应体
 │       └── handler/GlobalExceptionHandler.java
 │
@@ -201,6 +211,23 @@ export SHANA_LLM_API_KEY=sk-xxx
 
 > ⚠️ 不要把 key 写进 `application.yml` 的默认值里（`${VAR:sk-xxx}`），
 > 那等于把密钥写进 Git。密钥文件、`.env`、环境变量都在 `.gitignore` 保护范围内。
+
+**向量化模型要单独配一套 key。** DeepSeek 只提供 `/chat/completions`，没有 `/embeddings`，
+所以 RAG 用的 embedding 必须指向另一家（或本地 vLLM）：
+
+```bash
+# 例：硅基流动（bge-m3，1024 维）
+export SHANA_EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1
+export SHANA_EMBEDDING_MODEL=BAAI/bge-m3
+export SHANA_EMBEDDING_API_KEY=sk-xxx
+
+# 例：阿里百炼（1024 维）
+# export SHANA_EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+# export SHANA_EMBEDDING_MODEL=text-embedding-v3
+```
+
+不配这一组变量时，问答、记忆全都照常工作，只是知识库接口返回
+`503 未配置向量化模型`——RAG 是可选能力，不参与启动判定。
 
 ### 3. 启动应用（需要数据库）
 
@@ -328,6 +355,7 @@ mvn -pl shana-application test -Dtest=LiveChatSmokeTest
 - `shana-infrastructure/src/main/resources/db/migration/V1__create_chat_message.sql`
 - `shana-infrastructure/src/main/resources/db/migration/V2__add_sender_id_to_chat_message.sql`
 - `shana-infrastructure/src/main/resources/db/migration/V3__create_long_term_memory.sql`（`conversation_summary` + `memory_fact`，见下方「长期记忆」）
+- `shana-infrastructure/src/main/resources/db/migration/V4__create_rag_tables.sql`（`rag_document` + `rag_chunk`，含 pgvector 扩展，见下方「RAG」）
 
 ```
 chat_message
@@ -495,6 +523,184 @@ SELECT kind, subject, content FROM memory_fact WHERE conversation_id = 'group-1'
 
 ---
 
+## RAG：知识库与向量检索
+
+前面两层记忆解决"聊过什么"，RAG 解决"资料里怎么写的"。三者互不替代：
+
+| 层 | 来源 | 用途 |
+| --- | --- | --- |
+| 短期上下文 | 群聊消息（窗口内） | 接住刚才的话 |
+| 长期记忆 | 群聊消息（滚动摘要 + 事实） | 记住这个群的历史 |
+| **知识库** | **人上传的文档** | **回答"手册里怎么说"** |
+
+### 三层结构
+
+| 环节 | 实现 | 位置 |
+| --- | --- | --- |
+| 文档切分 | 段落 → 句子 → 硬切，块间重叠 | `shana-rag` / `TextSplitter` |
+| 向量化 | OpenAI 兼容 `/embeddings`，分批 + 顺序还原 + 维度校验 | `shana-model` / `OpenAiCompatibleEmbeddingClient` |
+| 存储与检索 | pgvector `vector(N)` + HNSW 余弦索引 | `shana-infrastructure` / `PgVectorStore` |
+
+### 两张表
+
+```sql
+rag_document                                              -- 一篇文档一行
+├── title        VARCHAR(200)
+├── source       VARCHAR(500)                             -- 文件路径 / URL / 群号
+├── content_hash CHAR(64)   UNIQUE                        -- 正文 SHA-256，上传幂等靠它
+└── chunk_count  INT
+
+rag_chunk                                                 -- 一个片段一行
+├── document_id BIGINT  REFERENCES rag_document(id) ON DELETE CASCADE
+├── chunk_index INT                                        -- 文档内顺序
+├── content     TEXT
+└── embedding   vector(1024)  NOT NULL                     -- 维度由配置注入
+
+CREATE INDEX ... USING hnsw (embedding vector_cosine_ops);
+```
+
+三个刻意的取舍：
+
+1. **不存原文**。原文没有任何查询用途，切片已覆盖全部内容；需要原文时从来源重新导入即可，
+   内容指纹能保证不会重复入库。
+2. **不用 IVFFlat**。IVFFlat 的聚类数依赖数据量，知识库从零开始时建索引几乎无效；
+   HNSW 边写边查都能用。
+3. **向量列不走 ORM**。`embedding` 用 `CAST(? AS vector)` 传字符串字面量，
+   不引入 pgvector 的 JDBC 类型扩展——避开了 MyBatis-Plus 类型处理器的一堆坑。
+
+### 入库流程
+
+```
+POST /api/v1/knowledge/documents
+  → 校验 title / content
+  → 确认向量化能力可用（缺配置直接 400，不白查一次库）
+  → 正文 SHA-256 → 查重（命中直接返回已有 documentId，一次 embedding 都不调）
+  → 切分：段落 → 句子 → 超长硬切，块间按 overlapChars 重叠
+  → 分批向量化（默认 16 条/批）
+  → 事务内写 rag_document + 全部 rag_chunk
+```
+
+并发上传同一份文档时，两个请求可能都过了查重。真正的防线是 `content_hash` 唯一索引 +
+`INSERT ... ON CONFLICT DO NOTHING`：后到的那个会拿到 `created=false`，
+既不重复写片段，也不报错——用唯一约束而不是"先查后插"，
+是因为 PG 事务里一旦抛出约束冲突就进入 aborted 状态，catch 之后连查询都做不了。
+
+### 检索与注入
+
+```
+POST /api/v1/chat
+  → system 人设
+  → 【群聊长期记忆】（若有）
+  → 【参考资料】（若有命中且相似度达标）
+  → 最近 20 条历史
+  → 调模型
+```
+
+三个刻意的克制：
+
+- **用当前这一句检索**，不是整段对话。整段会把之前的话题一起带进来，越聊越偏。
+- **没有达标片段就完全不注入**，不留一句"参考资料：无"。空标题会诱导模型去猜。
+- **检索失败只记日志**。它依赖外部嵌入服务，挂了不该让用户连话都说不了。
+
+阈值 `shana.rag.min-score` 默认 0.35，是偏宽松的起点：总是召回不到就调低，
+总是塞进无关内容就调高。`shana.rag.enabled=false` 可以整体关掉注入，
+但入库/检索接口仍然可用——便于单独确认召回质量，再决定要不要接进问答。
+
+### 接口
+
+```bash
+# 上传文档
+curl -X POST http://localhost:8080/api/v1/knowledge/documents \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Flink 运维手册","source":"docs/flink.md","content":"checkpoint 需要先配置 state backend……"}'
+# → {"code":200,"data":{"documentId":1,"chunkCount":7,"duplicate":false}}
+
+# 单独验证召回（不经过模型）
+curl "http://localhost:8080/api/v1/knowledge/search?q=checkpoint%20怎么配&topK=4"
+# → [{"documentId":1,"documentTitle":"Flink 运维手册","content":"...","score":0.83}]
+
+# 删除文档（片段靠外键级联删除）
+curl -X DELETE http://localhost:8080/api/v1/knowledge/documents/1
+```
+
+`/search` 的存在是为了可观测：没有它，RAG 出问题时只能靠看模型回答猜
+是"没检索到"还是"检索到了但模型没用"。
+
+### pgvector 安装
+
+V4 迁移会执行 `CREATE EXTENSION vector`，**没有这个扩展应用会启动失败**。
+
+**推荐：用 compose 里的镜像**（`pgvector/pgvector:pg17`，自带扩展）：
+
+```bash
+docker compose up -d postgres
+```
+
+如果本机 5432 已经有一个原生 PostgreSQL（没有 pgvector），两种做法：
+
+```bash
+# 做法一：让 compose 的实例换个端口，应用连 5433
+DB_PORT=5433 docker compose up -d postgres
+DB_PORT=5433 mvn -pl shana-application spring-boot:run
+
+# 做法二：给原生实例装扩展（Linux，需要编译）
+#   git clone --branch v0.7.4 https://github.com/pgvector/pgvector.git
+#   cd pgvector && make && make install
+#   psql -d shana -c "CREATE EXTENSION vector;"
+```
+
+`CREATE EXTENSION` 需要超级用户权限。compose 里 `POSTGRES_USER` 创建的就是超级用户，
+所以默认可用；托管数据库（RDS 等）通常需要单独授权。
+
+> 临时跳过：`FLYWAY_ENABLED=false` 能让应用起来，但知识库接口会因缺表而失败，
+> 只适合临时调别的东西。
+
+### 换嵌入模型时会发生什么
+
+`vector(N)` 的维度在迁移时写死（来自 `SHANA_EMBEDDING_DIM`）。换模型意味着维度可能变，
+**已经应用过的迁移不会重跑**，所以必须手工处理：
+
+```sql
+-- 1. 删掉旧向量数据（不同模型的向量不可比，混着用检索结果会乱）
+TRUNCATE rag_chunk;
+-- 2. 改列类型（维度必须一致，否则要 DROP COLUMN 后重建）
+ALTER TABLE rag_chunk ALTER COLUMN embedding TYPE vector(1536);
+-- 3. 重建索引
+DROP INDEX idx_rag_chunk_embedding;
+CREATE INDEX idx_rag_chunk_embedding ON rag_chunk USING hnsw (embedding vector_cosine_ops);
+```
+
+然后改 `SHANA_EMBEDDING_DIM` 与 `SHANA_EMBEDDING_MODEL`，重新上传文档。
+想避免这一步，可以在建库时就用最大的维度，但这会浪费存储且没有实际收益——
+换模型本来就需要重算全部向量。
+
+### 验证
+
+```sql
+-- 文档与片段规模
+SELECT id, title, chunk_count, created_at FROM rag_document ORDER BY id DESC LIMIT 10;
+SELECT document_id, count(*) FROM rag_chunk GROUP BY document_id;
+
+-- 直接看某条向量的前几维（确认写入的不是全零）
+SELECT id, left(content, 30), (embedding::real[])[1:3] FROM rag_chunk LIMIT 5;
+```
+
+日志里会看到：`知识库文档已入库: documentId=1, title=Flink 运维手册, chunks=7`。
+
+相关配置：
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `shana.embedding.*` | 见 `application.yml` | 向量化模型地址、key、模型名、维度、批量 |
+| `shana.rag.enabled` | true | 关掉后问答不检索，接口仍可用 |
+| `shana.rag.chunk.max-chars` | 800 | 单块上限（字符数，中文≈token） |
+| `shana.rag.chunk.overlap-chars` | 120 | 相邻块重叠 |
+| `shana.rag.chunk.min-chars` | 50 | 尾块低于此值并入前一块 |
+| `shana.rag.top-k` | 4 | 一次注入的片段数 |
+| `shana.rag.min-score` | 0.35 | 余弦相似度下限 |
+
+---
+
 ## Docker Compose（PostgreSQL / Redis）
 
 ```bash
@@ -522,14 +728,21 @@ docker compose down -v
 
 | 服务 | 地址 | 账号 |
 | --- | --- | --- |
-| PostgreSQL | `localhost:5432` / 库名 `shana` | `.env` 中的 `DB_USER` / `DB_PASSWORD` |
+| PostgreSQL（含 pgvector） | `localhost:5432` / 库名 `shana` | `.env` 中的 `DB_USER` / `DB_PASSWORD` |
 | Redis | `localhost:6379` | 密码为 `.env` 中的 `REDIS_PASSWORD` |
+
+> postgres 服务用的是 `pgvector/pgvector:pg17` 镜像，不是官方的 `postgres:17`。
+> 换成官方镜像后 V4 迁移会因缺少 `vector` 扩展而失败，应用起不来。
 
 应用侧读取的环境变量（含默认值，未设置时使用 `localhost` 与开发默认账号）：
 
 ```
 DB_HOST DB_PORT DB_NAME DB_USER DB_PASSWORD
 REDIS_HOST REDIS_PORT REDIS_PASSWORD
+SHANA_LLM_API_KEY SHANA_LLM_BASE_URL SHANA_LLM_MODEL
+SHANA_EMBEDDING_API_KEY SHANA_EMBEDDING_BASE_URL SHANA_EMBEDDING_MODEL SHANA_EMBEDDING_DIM
+SHANA_MEMORY_STORE SHANA_MEMORY_TTL
+SHANA_RAG_ENABLED SHANA_RAG_TOP_K SHANA_RAG_MIN_SCORE
 SERVER_PORT
 ```
 
@@ -687,6 +900,43 @@ java -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 -jar shana-application/targ
 
 Maven 用错了 JDK（看 `mvn -v` 输出的 Java version）。设置 `JAVA_HOME` 指向 JDK 21 即可。
 
+**4. 启动报 `extension "vector" is not available`**
+
+当前 PostgreSQL 实例没装 pgvector。V4 迁移里的 `CREATE EXTENSION vector` 会直接失败，
+应用起不来。三个选择：
+
+```bash
+# a. 用 compose 里的 pgvector 镜像（已在 5432 上跑着原生 PG 时换个端口）
+DB_PORT=5433 docker compose up -d postgres
+DB_PORT=5433 mvn -pl shana-application spring-boot:run
+
+# b. 给原生实例装扩展（Linux 需编译，见「RAG → pgvector 安装」）
+# c. 临时跳过迁移（知识库不可用，其余功能正常）
+FLYWAY_ENABLED=false mvn -pl shana-application spring-boot:run
+```
+
+**5. 问答正常，但知识库接口返回 `未配置向量化模型`**
+
+`shana.embedding.api-key` 为空。注意它不是 `SHANA_LLM_API_KEY`——DeepSeek 只有
+`/chat/completions`，没有 `/embeddings`，两组 key 通常来自不同服务商。
+
+**6. 上传文档报 `向量维度与配置不一致`**
+
+`shana.embedding.dimension` 与模型实际输出的维度不符（如用 1536 维的
+`text-embedding-3-small` 却配了 1024）。同时要改 `SHANA_EMBEDDING_DIM` 并重建向量表，
+否则写库时会被 `vector(N)` 拒绝。
+
+**7. 检索总是返回空**
+
+先去掉阈值直接看分布：
+
+```bash
+curl "http://localhost:8080/api/v1/knowledge/search?q=你的问题&topK=10"
+```
+
+如果 `score` 普遍低于 0.35，说明阈值偏高，调 `SHANA_RAG_MIN_SCORE`；
+如果一条都没有，检查文档是否真的入库（`SELECT count(*) FROM rag_chunk`）。
+
 ---
 
 ## 后续开发规划
@@ -701,7 +951,9 @@ Maven 用错了 JDK（看 `mvn -v` 输出的 Java version）。设置 `JAVA_HOME
    待补：Redis + PostgreSQL 的组合实现（缓存回源，兼顾共享与存档）。
 5. ~~**长期记忆**：对话摘要 + 关键信息抽取~~ ✅ 已完成（滚动摘要 + 追加式事实，异步、乐观并发）；
    待补：按相关性检索事实、摘要的定期重压缩（防止反复滚动后失真累积）。
-6. **RAG**：文档切分、Embedding、向量检索（PostgreSQL pgvector 或独立向量库）。
+6. ~~**RAG**：文档切分、Embedding、向量检索（PostgreSQL pgvector 或独立向量库）~~
+   ✅ 已完成（TextSplitter + OpenAI 兼容 /embeddings + pgvector HNSW，检索结果独立注入 prompt）；
+   待补：PDF/Word 解析、混合检索（向量 + 关键词）、rerank、多租户知识库隔离。
 7. **Agent / Tool Calling**：基于 `Tool` 扩展点实现单轮工具调用，再演进到多轮编排。
 8. **群聊分析与月度总结**：批量任务 + 报表输出。
 9. **流式输出**：把 `POST /api/v1/chat` 扩展为 SSE，边生成边返回，避免长时间等待。

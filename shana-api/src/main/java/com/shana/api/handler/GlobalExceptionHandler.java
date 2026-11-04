@@ -10,6 +10,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
@@ -55,6 +56,15 @@ public class GlobalExceptionHandler {
                 .map(violation -> violation.getPropertyPath() + ": " + violation.getMessage())
                 .collect(Collectors.joining("; "));
         log.warn("参数约束校验失败 [{} {}]: {}", request.getMethod(), request.getRequestURI(), detail);
+        return build(ErrorCode.BAD_REQUEST, detail);
+    }
+
+    /** 缺少必填的查询参数：不加此处理器会被兜底分支吞成 500，前端拿不到可读提示。 */
+    @ExceptionHandler(MissingServletRequestParameterException.class)
+    public ResponseEntity<Result<Void>> handleMissingParameter(
+            MissingServletRequestParameterException ex, HttpServletRequest request) {
+        String detail = "缺少必填参数: " + ex.getParameterName();
+        log.warn("缺少请求参数 [{} {}]: {}", request.getMethod(), request.getRequestURI(), detail);
         return build(ErrorCode.BAD_REQUEST, detail);
     }
 

@@ -6,7 +6,9 @@ name: shana
 
 services:
   postgres:
-    image: postgres:17-alpine
+    # 必须用带 pgvector 的镜像：V4 迁移会 CREATE EXTENSION vector。
+    # 换成官方 postgres:17 会导致迁移失败、应用启动不起来。
+    image: pgvector/pgvector:pg17
     container_name: shana-postgres
     restart: unless-stopped
     environment:

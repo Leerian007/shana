@@ -24,6 +24,11 @@
             <groupId>com.shana</groupId>
             <artifactId>shana-memory</artifactId>
         </dependency>
+        <!-- 实现 rag 定义的 VectorStore 端口，并装配 KnowledgeBase -->
+        <dependency>
+            <groupId>com.shana</groupId>
+            <artifactId>shana-rag</artifactId>
+        </dependency>
 
         <!-- 数据访问：MyBatis-Plus + PostgreSQL 驱动 -->
         <dependency>

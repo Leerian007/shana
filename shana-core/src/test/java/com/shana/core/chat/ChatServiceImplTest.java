@@ -16,6 +16,8 @@ import com.shana.model.LlmClient;
 import com.shana.model.LlmClientRegistry;
 import com.shana.model.LlmProvider;
 import com.shana.model.TokenUsage;
+import com.shana.rag.KnowledgeBase;
+import com.shana.rag.store.RetrievedChunk;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -30,6 +32,7 @@ import java.util.stream.Stream;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
@@ -60,7 +63,7 @@ class ChatServiceImplTest {
         llmClient = mock(LlmClient.class);
         registry = mock(LlmClientRegistry.class);
         given(registry.get(LlmProvider.OPENAI_COMPATIBLE)).willReturn(llmClient);
-        chatService = new ChatServiceImpl(memory, registry, absent(), absent(), LlmProvider.OPENAI_COMPATIBLE);
+        chatService = new ChatServiceImpl(memory, registry, absent(), absent(), absent(), LlmProvider.OPENAI_COMPATIBLE, true);
     }
 
     @Test
@@ -162,8 +165,8 @@ class ChatServiceImplTest {
                 "群里在讨论 Flink 的状态后端",
                 5L,
                 List.of(MemoryFact.of(FactKind.PERSON, "张三", "在学 Flink"))));
-        chatService = new ChatServiceImpl(memory, registry, present(longTermMemory), absent(),
-                LlmProvider.OPENAI_COMPATIBLE);
+        chatService = new ChatServiceImpl(memory, registry, present(longTermMemory), absent(), absent(),
+                LlmProvider.OPENAI_COMPATIBLE, true);
 
         given(memory.history(CONVERSATION_ID)).willReturn(List.of(ChatMessage.user("那 checkpoint 呢")));
         given(llmClient.chat(any())).willReturn(
@@ -187,8 +190,8 @@ class ChatServiceImplTest {
     void shouldNotInjectEmptyMemoryBlock() {
         LongTermMemory longTermMemory = mock(LongTermMemory.class);
         given(longTermMemory.load(CONVERSATION_ID, 10)).willReturn(MemorySnapshot.empty());
-        chatService = new ChatServiceImpl(memory, registry, present(longTermMemory), absent(),
-                LlmProvider.OPENAI_COMPATIBLE);
+        chatService = new ChatServiceImpl(memory, registry, present(longTermMemory), absent(), absent(),
+                LlmProvider.OPENAI_COMPATIBLE, true);
 
         given(memory.history(CONVERSATION_ID)).willReturn(List.of(ChatMessage.user("你好")));
         given(llmClient.chat(any())).willReturn(
@@ -205,8 +208,8 @@ class ChatServiceImplTest {
     @DisplayName("回复成功后触发一次后台摘要")
     void shouldTriggerSummaryAfterReply() {
         ConversationSummarizer summarizer = mock(ConversationSummarizer.class);
-        chatService = new ChatServiceImpl(memory, registry, absent(), present(summarizer),
-                LlmProvider.OPENAI_COMPATIBLE);
+        chatService = new ChatServiceImpl(memory, registry, absent(), present(summarizer), absent(),
+                LlmProvider.OPENAI_COMPATIBLE, true);
 
         given(memory.history(CONVERSATION_ID)).willReturn(List.of(ChatMessage.user("你好")));
         given(llmClient.chat(any())).willReturn(
@@ -222,8 +225,8 @@ class ChatServiceImplTest {
     void shouldSurviveSummarySchedulingFailure() {
         ConversationSummarizer summarizer = mock(ConversationSummarizer.class);
         willThrow(new IllegalStateException("队列满了")).given(summarizer).summarizeAsync(CONVERSATION_ID);
-        chatService = new ChatServiceImpl(memory, registry, absent(), present(summarizer),
-                LlmProvider.OPENAI_COMPATIBLE);
+        chatService = new ChatServiceImpl(memory, registry, absent(), present(summarizer), absent(),
+                LlmProvider.OPENAI_COMPATIBLE, true);
 
         given(memory.history(CONVERSATION_ID)).willReturn(List.of(ChatMessage.user("你好")));
         given(llmClient.chat(any())).willReturn(
@@ -232,6 +235,85 @@ class ChatServiceImplTest {
         ChatReply reply = chatService.reply(CONVERSATION_ID, "你好");
 
         assertThat(reply.content()).isEqualTo("你好");
+    }
+
+    @Test
+    @DisplayName("有检索结果时作为独立 system 消息插在历史之前")
+    void shouldInjectRetrievedChunksBeforeHistory() {
+        KnowledgeBase knowledgeBase = mock(KnowledgeBase.class);
+        given(knowledgeBase.search("checkpoint 怎么配", 4)).willReturn(List.of(
+                new RetrievedChunk(11L, 1L, "Flink 运维手册", "checkpoint 需要先配置 state backend", 0.82)));
+        chatService = new ChatServiceImpl(memory, registry, absent(), absent(), present(knowledgeBase),
+                LlmProvider.OPENAI_COMPATIBLE, true);
+
+        given(memory.history(CONVERSATION_ID)).willReturn(List.of(ChatMessage.user("checkpoint 怎么配")));
+        given(llmClient.chat(any())).willReturn(
+                new ChatResponse("先配 state backend", LlmProvider.OPENAI_COMPATIBLE, "test-model", TokenUsage.unknown()));
+
+        chatService.reply(CONVERSATION_ID, "checkpoint 怎么配");
+
+        ArgumentCaptor<ChatRequest> captor = ArgumentCaptor.forClass(ChatRequest.class);
+        verify(llmClient).chat(captor.capture());
+        List<ChatMessage> sent = captor.getValue().messages();
+
+        // 人设 → 参考资料 → 历史：资料属于"背景知识"，混进历史会被模型当成别人刚说过的话
+        assertThat(sent).hasSize(3);
+        assertThat(sent.get(1).role()).isEqualTo(ChatRole.SYSTEM);
+        assertThat(sent.get(1).content()).contains("参考资料", "Flink 运维手册", "state backend");
+        assertThat(sent.get(2).content()).isEqualTo("checkpoint 怎么配");
+    }
+
+    @Test
+    @DisplayName("检索到空结果时不插入空的参考段落")
+    void shouldNotInjectEmptyKnowledgeBlock() {
+        KnowledgeBase knowledgeBase = mock(KnowledgeBase.class);
+        given(knowledgeBase.search(anyString(), anyInt())).willReturn(List.of());
+        chatService = new ChatServiceImpl(memory, registry, absent(), absent(), present(knowledgeBase),
+                LlmProvider.OPENAI_COMPATIBLE, true);
+
+        given(memory.history(CONVERSATION_ID)).willReturn(List.of(ChatMessage.user("你好")));
+        given(llmClient.chat(any())).willReturn(
+                new ChatResponse("你好", LlmProvider.OPENAI_COMPATIBLE, "test-model", TokenUsage.unknown()));
+
+        chatService.reply(CONVERSATION_ID, "你好");
+
+        ArgumentCaptor<ChatRequest> captor = ArgumentCaptor.forClass(ChatRequest.class);
+        verify(llmClient).chat(captor.capture());
+        assertThat(captor.getValue().messages()).hasSize(2);
+    }
+
+    @Test
+    @DisplayName("知识库检索失败不影响本次回复")
+    void shouldSurviveKnowledgeSearchFailure() {
+        KnowledgeBase knowledgeBase = mock(KnowledgeBase.class);
+        given(knowledgeBase.search(anyString(), anyInt()))
+                .willThrow(new BusinessException(ErrorCode.SERVICE_UNAVAILABLE, "向量化服务超时"));
+        chatService = new ChatServiceImpl(memory, registry, absent(), absent(), present(knowledgeBase),
+                LlmProvider.OPENAI_COMPATIBLE, true);
+
+        given(memory.history(CONVERSATION_ID)).willReturn(List.of(ChatMessage.user("你好")));
+        given(llmClient.chat(any())).willReturn(
+                new ChatResponse("你好", LlmProvider.OPENAI_COMPATIBLE, "test-model", TokenUsage.unknown()));
+
+        ChatReply reply = chatService.reply(CONVERSATION_ID, "你好");
+
+        assertThat(reply.content()).isEqualTo("你好");
+    }
+
+    @Test
+    @DisplayName("显式关闭 RAG 后完全不查知识库")
+    void shouldSkipKnowledgeSearchWhenDisabled() {
+        KnowledgeBase knowledgeBase = mock(KnowledgeBase.class);
+        chatService = new ChatServiceImpl(memory, registry, absent(), absent(), present(knowledgeBase),
+                LlmProvider.OPENAI_COMPATIBLE, false);
+
+        given(memory.history(CONVERSATION_ID)).willReturn(List.of(ChatMessage.user("你好")));
+        given(llmClient.chat(any())).willReturn(
+                new ChatResponse("你好", LlmProvider.OPENAI_COMPATIBLE, "test-model", TokenUsage.unknown()));
+
+        chatService.reply(CONVERSATION_ID, "你好");
+
+        verify(knowledgeBase, never()).search(anyString(), anyInt());
     }
 
     /** 模拟容器里没有这个 Bean 的情况（Redis / 内存模式下长期记忆不存在）。 */

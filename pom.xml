@@ -23,6 +23,7 @@
     <modules>
         <module>shana-common</module>
         <module>shana-model</module>
+        <module>shana-rag</module>
         <module>shana-core</module>
         <module>shana-infrastructure</module>
         <module>shana-memory</module>
@@ -51,6 +52,11 @@
             <dependency>
                 <groupId>com.shana</groupId>
                 <artifactId>shana-model</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.shana</groupId>
+                <artifactId>shana-rag</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.shana</groupId>
+        <artifactId>shana</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>shana-rag</artifactId>
+    <name>shana-rag</name>
+    <description>检索增强：文档切分、知识库编排、向量检索端口</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.shana</groupId>
+            <artifactId>shana-common</artifactId>
+        </dependency>
+        <!-- 知识库入库与检索都要调用嵌入模型，因此依赖模型抽象；infrastructure 负责具体存储 -->
+        <dependency>
+            <groupId>com.shana</groupId>
+            <artifactId>shana-model</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
+        </dependency>
+    </dependencies>
+</project>

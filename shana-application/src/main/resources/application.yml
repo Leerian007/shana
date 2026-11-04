@@ -52,6 +52,10 @@ spring:
     enabled: ${FLYWAY_ENABLED:true}
     locations: classpath:db/migration
     baseline-on-migrate: true
+    placeholders:
+      # V4 的 vector(N) 列维度。必须与 shana.embedding.dimension 一致，
+      # 否则写入向量时会被数据库拒绝（错误信息里只有 "expected N dimensions"）
+      embeddingDimension: ${SHANA_EMBEDDING_DIM:1024}
 
   data:
     redis:
@@ -94,6 +98,34 @@ shana:
       # 没有 key 时适配器不会装配，接口返回“服务暂不可用”，但工程仍能正常启动
       api-key: ${SHANA_LLM_API_KEY:}
       temperature: ${SHANA_LLM_TEMPERATURE:0.7}
+
+  # 向量化模型（/embeddings）。与上面一套 key 分开配置，
+  # 因为 DeepSeek 只有 /chat/completions、没有 /embeddings，两组配置通常指向不同服务商。
+  # 常用组合：硅基流动 BAAI/bge-m3（1024 维）、阿里百炼 text-embedding-v3（1024 维）、
+  #          OpenAI text-embedding-3-small（1536 维，需同时改 dimension）
+  embedding:
+    base-url: ${SHANA_EMBEDDING_BASE_URL:https://api.siliconflow.cn/v1}
+    model: ${SHANA_EMBEDDING_MODEL:BAAI/bge-m3}
+    # 为空时整个 RAG 能力不装配：问答照常，入库/检索接口返回"未配置向量化模型"
+    api-key: ${SHANA_EMBEDDING_API_KEY:}
+    # 必须与数据库 vector(N) 一致，改这里等于要重建向量表（见 README）
+    dimension: ${SHANA_EMBEDDING_DIM:1024}
+    # 单次请求的文本条数，部分服务商限制在 16~32
+    batch-size: ${SHANA_EMBEDDING_BATCH:16}
+
+  rag:
+    # 关掉后问答不再注入检索结果，但入库/检索接口仍然可用——便于单独确认召回质量
+    enabled: ${SHANA_RAG_ENABLED:true}
+    chunk:
+      # 单块上限（字符数）。中文 1 字≈1 token，800 字对 bge-m3 是很稳的长度
+      max-chars: ${SHANA_RAG_CHUNK_MAX:800}
+      # 相邻块重叠：答案横跨两段时靠它把断点补回来
+      overlap-chars: ${SHANA_RAG_CHUNK_OVERLAP:120}
+      # 尾块低于此值并入前一块，避免产生"一句话 chunk"（几乎检索不到任何东西）
+      min-chars: ${SHANA_RAG_CHUNK_MIN:50}
+    top-k: ${SHANA_RAG_TOP_K:4}
+    # 余弦相似度下限。0.35 是偏宽松的起点：总是召回不到就调低，总是塞进无关内容就调高
+    min-score: ${SHANA_RAG_MIN_SCORE:0.35}
 
 management:
   endpoints:
