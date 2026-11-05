@@ -42,11 +42,12 @@ OpenAI 兼容协议的模型适配层、`POST /api/v1/chat` 问答链路、基�
 | `shana-common` | 统一响应 `Result`、错误码 `ErrorCode`、业务异常 `BusinessException` | 无 |
 | `shana-model` | 统一模型调用入口 `LlmClient`、`EmbeddingClient`、消息/请求/响应模型、`LlmClientRegistry` 路由 | common |
 | `shana-rag` | RAG 领域层：文档切分、知识库编排、向量存储端口 | common, model |
+| `shana-report` | 群聊分析领域层：月度统计模型、报表编排、Markdown 渲染、话题归纳 | common, model |
 | `shana-core` | 核心业务接口与领域模型，编排记忆/知识库，把"调模型 + 调工具"交给 Agent | common, model, memory, rag, agent |
-| `shana-infrastructure` | 数据访问（MyBatis-Plus + PostgreSQL）、Flyway 迁移、`ConversationMemory` 与 `VectorStore` 的实现、需要真实资源的工具（群聊统计） | common, core, memory, rag, agent |
+| `shana-infrastructure` | 数据访问（MyBatis-Plus + PostgreSQL）、Flyway 迁移、`ConversationMemory` 与 `VectorStore` 的实现、需要真实资源的工具（群聊统计）、报表取数与落盘 | common, core, memory, rag, agent, report |
 | `shana-memory` | 群聊上下文与长期记忆管理 | common, model |
 | `shana-agent` | Agent 循环、工具扩展点与注册表、多轮工具调用编排 | common, model |
-| `shana-api` | Controller、VO、全局异常处理 | common, core, rag |
+| `shana-api` | Controller、VO、全局异常处理 | common, core, rag, report |
 | `shana-application` | 装配所有模块，提供启动类与配置，唯一的可执行 jar | 全部模块 |
 
 依赖图（`──▶` 表示"依赖"，箭头指向被依赖方）：
@@ -58,11 +59,13 @@ shana-model ──▶ common
 
 shana-memory ──▶ model, common
 shana-agent  ──▶ model, common
+shana-rag    ──▶ model, common
+shana-report ──▶ model, common
 
 shana-core   ──▶ model, memory, rag, agent
 
-shana-infrastructure ──▶ core, memory, rag, agent   （由此传递依赖 model、common）
-shana-api            ──▶ core, rag   （由此传递依赖 model、common）
+shana-infrastructure ──▶ core, memory, rag, agent, report   （由此传递依赖 model、common）
+shana-api            ──▶ core, rag, report   （由此传递依赖 model、common）
 
 shana-application    ──▶ api, core, infrastructure, model, memory, agent
 ```
@@ -121,11 +124,20 @@ shana/
 │       ├── memory/             # 长期记忆编排：摘要生成、结果解析、prompt 渲染
 │       └── health/             # 核心服务示例：SystemHealthService
 │
+├── shana-report/
+│   └── src/main/java/com/shana/report/
+│       ├── ReportPeriod.java / GroupActivity.java        # 周期与统计结果
+│       ├── GroupActivitySource.java / ReportRepository.java  # 取数与存储端口
+│       ├── MonthlyReportService.java                     # 编排：取数→总结→渲染→入库→归档
+│       ├── NarrativeGenerator.java                       # AI 话题归纳（失败降级）
+│       └── MarkdownReportRenderer.java                   # 纯函数渲染
+│
 ├── shana-infrastructure/
 │   └── src/main/java/com/shana/infrastructure/
-│       ├── config/             # MyBatis-Plus 配置、知识库装配
+│       ├── config/             # MyBatis-Plus 配置、知识库装配、报表装配
 │       ├── agent/              # 工具实现：群聊发言统计
-│       └── persistence/        # 上下文 / 长期记忆 / 知识库实现，实体与 Mapper
+│       ├── report/             # 报表落盘与每月定时任务
+│       └── persistence/        # 上下文 / 长期记忆 / 知识库 / 报表实现，实体与 Mapper
 │
 ├── shana-memory/
 │   └── src/main/java/com/shana/memory/
@@ -146,7 +158,7 @@ shana/
 │
 ├── shana-api/
 │   └── src/main/java/com/shana/api/
-│       ├── controller/         # HealthController、ChatController、KnowledgeController
+│       ├── controller/         # HealthController、ChatController、KnowledgeController、ReportController
 │       ├── dto/ vo/            # 请求体与响应体
 │       └── handler/GlobalExceptionHandler.java
 │
@@ -367,6 +379,7 @@ mvn -pl shana-application test -Dtest=LiveChatSmokeTest
 - `shana-infrastructure/src/main/resources/db/migration/V2__add_sender_id_to_chat_message.sql`
 - `shana-infrastructure/src/main/resources/db/migration/V3__create_long_term_memory.sql`（`conversation_summary` + `memory_fact`，见下方「长期记忆」）
 - `shana-infrastructure/src/main/resources/db/migration/V4__create_rag_tables.sql`（`rag_document` + `rag_chunk`，含 pgvector 扩展，见下方「RAG」）
+- `shana-infrastructure/src/main/resources/db/migration/V5__create_group_monthly_report.sql`（`group_monthly_report`，见下方「群聊月度报表」）
 
 ```
 chat_message
@@ -802,6 +815,139 @@ curl -X POST http://localhost:8080/api/v1/chat -H "Content-Type: application/jso
 
 ---
 
+## 群聊月度报表
+
+把 `chat_message` 里的全量历史按月聚合成一份可读报表：谁在说话、哪天最热闹、几点最活跃、
+这个月主要在聊什么。统计靠 SQL 聚合，话题靠模型归纳，两者互不阻塞。
+
+### 统计口径
+
+只算**成员发言**：`role = 'user'` 且 `sender_id IS NOT NULL`。
+
+- 助手自己的回复不计入。它不是群里的"人"，算进去会让"人均发言"失真——
+  而且助手说得越多（群越活跃）人均反而越高，逻辑是反的；
+- 未带 `sender_id` 的历史消息同样排除，否则会凭空多出一个匿名成员。
+
+这个条件只写在一处（`GroupReportMapper.xml` 的 `memberMessages` 片段），
+所有查询都 include 它，保证"总条数""排行之和""每日之和""每小时之和"永远对得上。
+总条数由成员行加总得出，而不是另跑一次 `count(*)`——两次查询之间若有新消息写入，
+报表里的数字就会自相矛盾。
+
+### 批量任务
+
+| 项 | 说明 |
+| --- | --- |
+| 触发 | `@Scheduled` 每月 1 号 02:30，周期固定为**上月**（1 号跑当月只有几小时数据） |
+| 范围 | 只跑该月有成员发言的群，不给死群生成全零报表 |
+| 失败 | 单群失败不中断整批，失败清单随结果返回 |
+| 多实例 | 会重复跑（无分布式锁）。重跑幂等，结果一致，代价只是多花几次模型调用 |
+
+### 接口
+
+```bash
+# 批量生成上月（不传 period 即为上月）
+curl -X POST "http://localhost:8080/api/v1/reports/monthly"
+
+# 指定周期批量生成
+curl -X POST "http://localhost:8080/api/v1/reports/monthly?period=2026-10"
+
+# 单群生成/重跑（覆盖语义）
+curl -X POST "http://localhost:8080/api/v1/reports/monthly/group-alpha?period=2026-10"
+
+# 列表（摘要，不含 Markdown 正文）
+curl "http://localhost:8080/api/v1/reports/monthly?period=2026-10"
+
+# 详情（含 narrative 与 Markdown 全文）
+curl "http://localhost:8080/api/v1/reports/monthly/group-alpha?period=2026-10"
+```
+
+`period` 一律可选，缺省为上个月；格式错返回 400，没有报表返回 404，
+报表能力未装配（`store=redis`）返回 503。
+
+### 输出样例
+
+```text
+# 群聊月度报告 · 2026 年 10 月
+
+- 群：`group-alpha`
+- 周期：2026-10-01 ~ 2026-10-31
+- 生成时间：2026-11-05 16:19
+
+## 概览
+
+| 指标 | 数值 |
+| --- | --- |
+| 成员发言 | 105 条 |
+| 活跃成员 | 5 人 |
+| 人均发言 | 21.0 条 |
+| 最活跃的一天 | 10-18（14 条） |
+| 最活跃时段 | 21:00–22:00 |
+| 无发言天数 | 17 天 |
+
+## 本月话题
+
+- 多次提到订单表分库分片键选 user_id 还是 order_id，以及跨库查询是否上宽表
+- 反复讨论压测脚本 QPS 到 8000 报错，以及双十一大促压测方案要提前定
+...
+```
+
+每日与时段两张表都会**补零**：`group by` 只返回有消息的日期，渲染时补全整月 / 24 小时。
+"11 号到 15 号一条都没有"本身就是结论，不能因为查询没返回这几行就消失。
+
+### 配置
+
+```yaml
+shana:
+  report:
+    enabled: true                 # 总开关；同时要求 memory.store=jdbc
+    archive:
+      enabled: true               # Markdown 落盘（副本，库里的记录才是主）
+      dir: ./reports              # 目录结构 <dir>/<yyyy-MM>/<群名>.md
+    narrative:
+      enabled: true               # 关掉只出统计数字，不调模型
+      max-samples: 120            # 送模型的样本条数上限
+    schedule:
+      enabled: true               # 多实例部署时只开一个
+      cron: "0 30 2 1 * ?"
+```
+
+`reports/` 已加入 `.gitignore`：它是生成物，主数据在 `group_monthly_report` 表。
+
+### 四个设计取舍
+
+1. **统计与渲染分离**。`GroupActivity` 只放算出来的数字，条形图长度、Top N 截断、
+   百分比小数位都在渲染层决定。换输出格式（HTML、Excel）不用重新计算统计。
+2. **报表存 Markdown 全文而不只是明细**。报表是快照，半年后看到的 10 月报表必须和当时
+   发出去的一致；只存明细再重新渲染，渲染逻辑一改历史报表就变了。代价是几 KB 冗余。
+3. **失败分级**。话题总结失败 → 降级，报表照出并写明原因；落盘失败 → 降级，记日志；
+   取数或入库失败 → 抛出。"没有总结"和"总结失败"必须能区分，否则会被误读成"这个群没聊什么"。
+4. **抽样均匀而不是取后 N 条**。`ORDER BY created_at DESC LIMIT 120` 只会反映月末的话题。
+   实现上先用窗口函数给整月消息编号，再按 `ceil(总数/limit)` 等间隔取点。
+
+### 验证
+
+```bash
+# 1. 造点历史数据后生成
+curl -X POST "http://localhost:8080/api/v1/reports/monthly?period=2026-10"
+
+# 2. 文件落在这里
+ls reports/2026-10/
+
+# 3. 核对口径：报表里的条数应等于下面这条 SQL 的 counted_msgs
+psql -d shana -c "
+select conversation_id,
+       count(*) as raw_msgs,
+       count(*) filter (where role='user' and sender_id is not null) as counted_msgs
+from chat_message
+where created_at >= '2026-10-01' and created_at < '2026-11-01'
+group by conversation_id;"
+```
+
+实测（169 条造数据 + 2 条干扰数据）：`group-alpha` 原始 107 条 → 报表 105 条、5 人，
+排行之和个人字数与概览一致；每日 31 行、时段 24 行；3 个群批量生成耗时 3.5 秒。
+
+---
+
 ## Docker Compose（PostgreSQL / Redis）
 
 ```bash
@@ -1063,5 +1209,7 @@ curl "http://localhost:8080/api/v1/knowledge/search?q=你的问题&topK=10"
 7. ~~**Agent / Tool Calling**：基于 `Tool` 扩展点实现单轮工具调用，再演进到多轮编排~~
    ✅ 已完成（`ToolCallingAgent` 多轮循环 + 轮次上限兜底 + 首个真实工具「群聊发言统计」）；
    待补：一次性并行调用、工具级超时、多 Agent 协作。
-8. **群聊分析与月度总结**：批量任务 + 报表输出。
+8. ~~**群聊分析与月度总结**：批量任务 + 报表输出~~
+   ✅ 已完成（SQL 聚合 + AI 话题归纳 + Markdown 报表 + 每月 1 号定时任务 + 生成/查询接口）；
+   待补：按周/按人报表、报表对比（环比上月）、HTML 可视化、导出 Excel。
 9. **流式输出**：把 `POST /api/v1/chat` 扩展为 SSE，边生成边返回，避免长时间等待。

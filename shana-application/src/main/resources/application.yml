@@ -136,6 +136,24 @@ shana:
     # 余弦相似度下限。0.35 是偏宽松的起点：总是召回不到就调低，总是塞进无关内容就调高
     min-score: ${SHANA_RAG_MIN_SCORE:0.35}
 
+  # 群聊月度报表。依赖全量历史，只在 store=jdbc 下装配（Redis 模式会淘汰旧消息，按月统计不成立）
+  report:
+    enabled: ${SHANA_REPORT_ENABLED:true}
+    archive:
+      # Markdown 落盘是副本，库里的记录才是主。容器部署时文件系统常是临时的，可关掉
+      enabled: ${SHANA_REPORT_ARCHIVE:true}
+      dir: ${SHANA_REPORT_DIR:./reports}
+    narrative:
+      # 关掉只出统计数字，不调模型。排查"报表很慢/很贵"时先关这个
+      enabled: ${SHANA_REPORT_NARRATIVE:true}
+      # 送给模型归纳话题的样本条数。越大越能覆盖整月，token 成本线性上涨
+      max-samples: ${SHANA_REPORT_SAMPLES:120}
+    schedule:
+      # 每月 1 号 02:30 生成上月报表。避开整点，也避开当月不完整的数据
+      # 多实例部署时只让一个实例打开，避免重复调用模型
+      enabled: ${SHANA_REPORT_SCHEDULE:true}
+      cron: ${SHANA_REPORT_CRON:0 30 2 1 * ?}
+
 management:
   endpoints:
     web:

@@ -38,3 +38,6 @@ application-secret.yml
 
 # ---------- 本地数据 ----------
 data/
+
+# 月度报表的 Markdown 副本（库里的 group_monthly_report 才是主数据）
+reports/

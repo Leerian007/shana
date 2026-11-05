@@ -28,6 +28,11 @@
             <groupId>com.shana</groupId>
             <artifactId>shana-rag</artifactId>
         </dependency>
+        <!-- 报表同理：Controller 直接调 MonthlyReportService，不经 core -->
+        <dependency>
+            <groupId>com.shana</groupId>
+            <artifactId>shana-report</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>

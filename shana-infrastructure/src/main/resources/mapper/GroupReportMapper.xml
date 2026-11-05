@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  报表聚合查询。
+
+  统一口径（memberMessages 片段）：只统计"成员发言"。
+  - role = 'user'：排除助手自己的回复。助手说得越多，群看起来越活跃，
+    但它不是群里的"人"，算进人均发言会让指标失去意义。
+  - sender_id IS NOT NULL：未接入成员体系时期的旧消息没有发送者，
+    计入会凭空多出一个匿名成员，也会让"活跃成员数"永远至少为 1。
+  - 左闭右开 [from, to)：timestamptz 有小数秒，用 23:59:59 做上界会漏掉最后不到一秒。
+
+  所有查询都 include 这个片段，保证"总条数""成员条数之和""每日之和""每小时之和"
+  永远对得上。分散写条件最容易出的错是漏掉某一个，然后报表里数字互相矛盾。
+-->
+<mapper namespace="com.shana.infrastructure.persistence.mapper.GroupReportMapper">
+
+    <sql id="memberMessages">
+        conversation_id = #{conversationId}
+        AND role = 'user'
+        AND sender_id IS NOT NULL
+        AND created_at &gt;= #{from}
+        AND created_at &lt; #{to}
+    </sql>
+
+    <select id="aggregateByMember" resultType="com.shana.infrastructure.persistence.dto.ReportAggregates$MemberRow">
+        SELECT sender_id,
+               count(*)                                AS message_count,
+               coalesce(sum(char_length(content)), 0)  AS char_count,
+               min(created_at)                         AS first_at,
+               max(created_at)                         AS last_at
+        FROM chat_message
+        WHERE <include refid="memberMessages"/>
+        GROUP BY sender_id
+        ORDER BY message_count DESC, sender_id
+    </select>
+
+    <select id="aggregateByDay" resultType="com.shana.infrastructure.persistence.dto.ReportAggregates$DailyRow">
+        SELECT (created_at AT TIME ZONE 'Asia/Shanghai')::date AS day,
+               count(*)                                       AS message_count
+        FROM chat_message
+        WHERE <include refid="memberMessages"/>
+        GROUP BY day
+        ORDER BY day
+    </select>
+
+    <select id="aggregateByHour" resultType="com.shana.infrastructure.persistence.dto.ReportAggregates$HourlyRow">
+        SELECT extract(hour FROM (created_at AT TIME ZONE 'Asia/Shanghai'))::int AS hour_of_day,
+               count(*)                                                         AS message_count
+        FROM chat_message
+        WHERE <include refid="memberMessages"/>
+        GROUP BY hour_of_day
+        ORDER BY hour_of_day
+    </select>
+
+    <!--
+      均匀抽样，而不是 ORDER BY created_at LIMIT N。
+      后者只会取到月初（或月末）那一段，归纳出来的"本月话题"其实是"月初话题"。
+      做法：先给整月消息按时间编号，再按 ceil(总数/limit) 等间隔取点，
+      这样样本在整月上是铺开的，且条数不会超过 limit（用 ceil 而不是整数除法，
+      350 条抽 100 条时每 4 条取 1，得到 87 条，而不是每 3 条取 1 再被 LIMIT 砍掉末尾）。
+    -->
+    <select id="sampleMessages" resultType="com.shana.infrastructure.persistence.dto.ReportAggregates$SampleRow">
+        WITH filtered AS (
+            SELECT sender_id,
+                   content,
+                   created_at,
+                   row_number() OVER (ORDER BY created_at, id) AS rn,
+                   count(*) OVER ()                           AS total
+            FROM chat_message
+            WHERE <include refid="memberMessages"/>
+        )
+        SELECT sender_id, content, created_at
+        FROM filtered
+        WHERE total &lt;= #{limit}
+           OR (rn - 1) % GREATEST(ceil(total::numeric / #{limit})::int, 1) = 0
+        ORDER BY created_at
+        LIMIT #{limit}
+    </select>
+
+    <select id="conversationsActiveIn" resultType="java.lang.String">
+        SELECT conversation_id
+        FROM chat_message
+        WHERE role = 'user'
+          AND sender_id IS NOT NULL
+          AND created_at &gt;= #{from}
+          AND created_at &lt; #{to}
+        GROUP BY conversation_id
+        ORDER BY count(*) DESC
+    </select>
+
+</mapper>

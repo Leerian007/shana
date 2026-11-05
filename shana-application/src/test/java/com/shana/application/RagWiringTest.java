@@ -22,9 +22,18 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *
  * <p>本测试不需要真实数据库：DataSource 是懒建连的，Flyway 在 test profile 下关闭，
  * 所以只验证装配，不验证 SQL。
+ *
+ * <p>注意 {@code shana.embedding.api-key=} 这一行：<b>必须显式清空</b>。
+ * 下面那个测试要验证的正是"没配 key 时的报错"，而 {@code application-secret.yml}
+ * 会被 {@code spring.config.import} 加载（开发机上通常填了真实 key）。
+ * 不清空的话，这个测试的通过与否取决于"跑测试的机器有没有配 key"——
+ * 本地绿、CI 红，或者相反。测试不能依赖开发机的私有配置。
  */
 @ActiveProfiles("test")
-@SpringBootTest(properties = "shana.memory.store=jdbc")
+@SpringBootTest(properties = {
+        "shana.memory.store=jdbc",
+        "shana.embedding.api-key="
+})
 class RagWiringTest {
 
     @Autowired
