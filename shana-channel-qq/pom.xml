@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.shana</groupId>
+        <artifactId>shana</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>shana-channel-qq</artifactId>
+    <name>shana-channel-qq</name>
+    <description>QQ 渠道：以 OneBot v11 协议对接 NapCat，把群聊/私聊消息接入问答链路</description>
+
+    <dependencies>
+        <!-- 只需要 core 暴露的 ChatService 端口，不依赖 HTTP 层，也不依赖任何 QQ 私有协议库 -->
+        <dependency>
+            <groupId>com.shana</groupId>
+            <artifactId>shana-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
+        </dependency>
+        <!-- 事件与动作都是 JSON。WebSocket 用 JDK 自带实现，不引入额外网络库 -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+    </dependencies>
+</project>

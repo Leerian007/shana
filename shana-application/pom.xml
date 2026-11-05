@@ -39,6 +39,11 @@
             <groupId>com.shana</groupId>
             <artifactId>shana-agent</artifactId>
         </dependency>
+        <!-- QQ 渠道默认关闭（shana.qq.enabled=false），引入它只是为了打成一个包时能就地打开 -->
+        <dependency>
+            <groupId>com.shana</groupId>
+            <artifactId>shana-channel-qq</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>

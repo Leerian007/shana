@@ -165,6 +165,40 @@ shana:
       enabled: ${SHANA_REPORT_SCHEDULE:true}
       cron: ${SHANA_REPORT_CRON:0 30 2 1 * ?}
 
+  # QQ 渠道（OneBot v11 + NapCat）。默认关闭：没装 NapCat 的部署不该在日志里刷连接失败。
+  # 打开方式见 README「接入 QQ」一节——先跑 NapCat 扫码登录，再建一个「WebSocket 服务器」
+  qq:
+    enabled: ${SHANA_QQ_ENABLED:false}
+    # 正向 WS：后端主动连 NapCat。NapCat 那边建的是「WebSocket 服务器」（默认端口 3001）
+    ws-url: ${SHANA_QQ_WS_URL:ws://127.0.0.1:3001}
+    # 与 NapCat 网络配置里的 token 一致；留空表示不鉴权
+    access-token: ${SHANA_QQ_ACCESS_TOKEN:}
+    api-timeout: ${SHANA_QQ_API_TIMEOUT:10s}
+    # 心跳兼作"断线探测"：NAT 会悄悄掐掉空闲长连接，不发包就发现不了
+    heartbeat-interval: ${SHANA_QQ_HEARTBEAT:30s}
+    reconnect-initial-delay: 1s
+    reconnect-max-delay: 30s
+    # 连续消息的聚合窗口：把"一句话拆三条发"拼回一句再问，省调用也更准
+    debounce-window: ${SHANA_QQ_DEBOUNCE:900ms}
+    # 聚合正文上限，超出部分丢弃，防止有人粘贴一整篇文档把 prompt 撑爆
+    debounce-max-chars: 2000
+    # 单条回复的字符上限，超过则分段发送；段间留间隔，发太快会被风控
+    reply-max-chars: ${SHANA_QQ_REPLY_MAX_CHARS:1200}
+    reply-interval: ${SHANA_QQ_REPLY_INTERVAL:400ms}
+    group-enabled: true
+    # 群聊必须 @ 才回。关掉后群里任何一句话都会触发模型调用，人多的时候会烧钱
+    require-at: ${SHANA_QQ_REQUIRE_AT:true}
+    # 群白名单，逗号分隔的群号；留空表示所有群都响应
+    group-whitelist: ${SHANA_QQ_GROUPS:}
+    private-enabled: true
+    # 只认好友私聊；group=群临时会话、other=陌生人，加上它们等于对任何点开对话框的人开放
+    private-sub-types: friend
+    # 用户白名单，逗号分隔的 QQ 号；留空表示所有用户
+    user-whitelist: ${SHANA_QQ_USERS:}
+    executor-core-size: 2
+    executor-max-size: 8
+    executor-queue-capacity: 200
+
 management:
   endpoints:
     web:

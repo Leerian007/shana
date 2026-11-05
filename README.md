@@ -47,6 +47,7 @@ OpenAI 兼容协议的模型适配层、`POST /api/v1/chat` 问答链路、基�
 | `shana-infrastructure` | 数据访问（MyBatis-Plus + PostgreSQL）、Flyway 迁移、`ConversationMemory` 与 `VectorStore` 的实现、需要真实资源的工具（群聊统计）、报表取数与落盘 | common, core, memory, rag, agent, report |
 | `shana-memory` | 群聊上下文与长期记忆管理 | common, model |
 | `shana-agent` | Agent 循环、工具扩展点与注册表、多轮工具调用编排 | common, model |
+| `shana-channel-qq` | QQ 渠道：OneBot v11 客户端、事件解析、准入策略、消息聚合与分段发送 | core |
 | `shana-api` | Controller、VO、全局异常处理、SSE 事件适配与流式线程池 | common, core, rag, report |
 | `shana-application` | 装配所有模块，提供启动类与配置，唯一的可执行 jar | 全部模块 |
 
@@ -66,8 +67,9 @@ shana-core   ──▶ model, memory, rag, agent
 
 shana-infrastructure ──▶ core, memory, rag, agent, report   （由此传递依赖 model、common）
 shana-api            ──▶ core, rag, report   （由此传递依赖 model、common）
+shana-channel-qq     ──▶ core                （渠道只认 ChatService，不认识 HTTP 与存储）
 
-shana-application    ──▶ api, core, infrastructure, model, memory, agent
+shana-application    ──▶ api, core, infrastructure, model, memory, agent, channel-qq
 ```
 
 整体是一条单向链，不存在循环依赖；可用 `mvn dependency:tree -Dincludes=com.shana` 验证。
@@ -155,6 +157,15 @@ shana/
 │           ├── Tool.java                # 扩展点
 │           ├── ToolContext.java         # 会话上下文（模型无法伪造）
 │           └── ToolRegistry.java
+│
+├── shana-channel-qq/
+│   └── src/main/java/com/shana/channel/qq/
+│       ├── OneBotEventParser.java        # 事件 JSON → IncomingMessage（array 与 CQ 码两种格式）
+│       ├── ReplyPolicy.java              # 该不该回：自己/白名单/@/私聊子类型
+│       ├── MessageAggregator.java        # 滑动窗口合并连续消息
+│       ├── ReplyChunker.java             # 长回复分段（按句/换行，不劈代理对）
+│       ├── OneBotWsClient.java           # 正向 WebSocket、echo 关联、退避重连、心跳
+│       └── QqChatHandler.java            # 编排：解析→去重→准入→聚合→ChatService→发送
 │
 ├── shana-api/
 │   └── src/main/java/com/shana/api/
@@ -1080,6 +1091,111 @@ curl -N -X POST http://localhost:8080/api/v1/chat/stream \
 
 ---
 
+## 接入 QQ（NapCat + OneBot v11）
+
+把 QQ 接进来不需要改动问答链路：渠道模块只依赖 `ChatService`，
+所以上下文、长期记忆、RAG、工具调用全都自动复用，`conversationId` 从「群聊 ID」换成
+`qq:group:<群号>` / `qq:private:<QQ号>` 即可。
+
+```
+QQ 服务器 ──▶ NapCat（协议端，寄生官方 NTQQ）──▶ OneBot v11（WebSocket）
+                                                     │
+                                            shana-channel-qq
+                                                     │
+                                          ChatService（记忆 / RAG / Agent）
+```
+
+### 为什么选 NapCat
+
+| 方案 | 现状 | 结论 |
+| --- | --- | --- |
+| **NapCatQQ** | 活跃，走官方 NTQQ 客户端，腾讯升级它跟进 | 采用 |
+| go-cqhttp | 早已停更，旧内核风控严重 | 不用 |
+| Lagrange.Core V1 | 2025-10 已归档（签名服务器关停） | 装上也登不进 |
+| QQ 开放平台官方机器人 | 合规、无封号风险 | 对外产品应优先，但功能受限 |
+
+NapCat 不逆向协议，而是无头运行官方 QQ 客户端再翻译成 OneBot。
+好处是"协议被一刀切"的概率低；代价是**账号级风控依然存在**——务必用小号。
+
+### 1. 先把 NapCat 跑起来
+
+1. 从 [NapNeko/NapCatQQ](https://github.com/NapNeko/NapCatQQ/releases) 下载 `NapCat.Shell`，解压启动，
+   控制台会打印 WebUI 地址（默认 `http://127.0.0.1:6099`）；
+2. 手机 QQ 扫码登录（这个号之后就只能被 NapCat 占用，手机端会被挤下线）；
+3. 进 WebUI → **网络配置** → 新建 → **WebSocket 服务器**：
+   - 端口 `3001`
+   - Token 可留空；填了就要和下面 `SHANA_QQ_ACCESS_TOKEN` 一致
+   - `message_format` 建议显式设为 `array`（默认即是）
+
+> 方向很容易搞反：**本服务是客户端，NapCat 是服务端**。
+> 所以 NapCat 那边建的是「WebSocket 服务器」，不是「WebSocket 客户端」。
+
+### 2. 打开开关
+
+```bash
+export SHANA_QQ_ENABLED=true
+export SHANA_QQ_WS_URL=ws://127.0.0.1:3001
+# 可选：只允许特定群与用户
+export SHANA_QQ_GROUPS=123456789,987654321
+export SHANA_QQ_USERS=
+```
+
+对应 `application.yml` 的 `shana.qq.*`，关键几项：
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `enabled` | false | 关闭时不起线程、不连网，日志干净 |
+| `ws-url` | `ws://127.0.0.1:3001` | 正向 WS 地址 |
+| `access-token` | 空 | 与 NapCat 网络配置一致 |
+| `require-at` | true | 群聊必须 @ 才回 |
+| `group-whitelist` / `user-whitelist` | 空 | 空表示不限制 |
+| `debounce-window` | 900ms | 连续消息的聚合窗口 |
+| `reply-max-chars` | 1200 | 单条上限，超过分段 |
+| `heartbeat-interval` | 30s | 兼作断线探测，`0s` 关闭 |
+
+### 3. 验证
+
+```bash
+# 启动日志里应出现（连不上会按 1s→2s→4s… 退避重试，不影响 HTTP 接口）
+# 已连接 NapCat：ws://127.0.0.1:3001
+```
+
+1. 用另一个号**私聊**机器人发「你好」；
+2. 把机器人拉进群，**@ 它**问「今天谁发言最多」——会走工具调用查库；
+3. 连发三条短消息，应当合并成一次提问、只回一条。
+
+### 4. 回复规则
+
+| 场景 | 默认行为 |
+| --- | --- |
+| 好友私聊 | 回复（私聊没有 @ 概念） |
+| 群临时会话 / 陌生人 | **不回复**（`private-sub-types` 只放行 `friend`） |
+| 群聊 @ 机器人 | 回复 |
+| 群聊没 @ | 不回复 |
+| 自己发出的消息（回显） | 不回复，否则会自己回自己 |
+| 纯图片 / 纯表情 | 不回复（正文为空） |
+| 重复推送的同一 `message_id` | 只处理一次（断线重连会重发） |
+
+私聊的准入只能靠「是不是好友」——没有 @ 可判断，所以 `private-sub-types` 这一项别随手放宽。
+
+### 5. 几个刻意的取舍
+
+- **不做流式**：群聊逐字输出会变成几十条消息，刷屏且无法撤回。攒完整段再按 1200 字分段发送，
+  段间留 400ms，避免被当成刷屏；
+- **900ms 滑动窗口**：IM 里「一句话拆三条」太常见，逐条问模型既贵又答非所问；
+- **首段带引用**：群里同时多人提问时，引用原消息能立刻说明在答谁，后续分段不再引用；
+- **只实现正向 WS**：不用在本服务上开端口。若 NapCat 在内网、本服务在外网，需要反向 WS，
+  那要额外引入 `spring-boot-starter-websocket` 并加一个端点，当前未实现。
+
+### 6. 已知边界
+
+- 图片、语音、文件不做识别，消息正文为空时直接忽略；
+- 好友申请是 `request` 事件，不会自动通过（需要显式调 `set_friend_add_request`）；
+- 同一 QQ 只能被一个 NapCat 实例登录，多实例部署时渠道只应在一个实例上打开；
+- 第三方协议端登录个人号属于非官方用法，存在封号风险，请用小号。
+
+---
+
 ## Docker Compose（PostgreSQL / Redis）
 
 ```bash
@@ -1348,3 +1464,7 @@ curl "http://localhost:8080/api/v1/knowledge/search?q=你的问题&topK=10"
    ✅ 已完成（`POST /api/v1/chat/stream`，`meta`/`delta`/`reset`/`tool`/`done`/`error` 六类事件，
    工具轮次与纯文本共用一套循环，客户端断开即停止生成）；
    待补：流式过程中的空闲超时检测、多实例下的连接粘性与限流。
+10. ~~**QQ 渠道**：把群聊/私聊消息接进来，复用同一套问答链路~~
+    ✅ 已完成（`shana-channel-qq`：NapCat 正向 WS + OneBot v11，准入策略、防抖聚合、分段发送，
+    默认关闭，`SHANA_QQ_ENABLED=true` 打开）；
+    待补：反向 WS（NapCat 在外网时）、图片/语音理解、好友申请自动处理、多渠道（飞书/企微）适配。

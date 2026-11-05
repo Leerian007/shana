@@ -29,6 +29,7 @@
         <module>shana-infrastructure</module>
         <module>shana-memory</module>
         <module>shana-agent</module>
+        <module>shana-channel-qq</module>
         <module>shana-api</module>
         <module>shana-application</module>
     </modules>
@@ -83,6 +84,11 @@
             <dependency>
                 <groupId>com.shana</groupId>
                 <artifactId>shana-agent</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.shana</groupId>
+                <artifactId>shana-channel-qq</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
