@@ -29,6 +29,11 @@
             <groupId>com.shana</groupId>
             <artifactId>shana-rag</artifactId>
         </dependency>
+        <!-- 工具实现放在这一层：它们需要数据库、缓存等真实资源，而 agent 模块只定义扩展点 -->
+        <dependency>
+            <groupId>com.shana</groupId>
+            <artifactId>shana-agent</artifactId>
+        </dependency>
 
         <!-- 数据访问：MyBatis-Plus + PostgreSQL 驱动 -->
         <dependency>

@@ -9,6 +9,8 @@ import com.shana.model.ChatRequest;
 import com.shana.model.ChatResponse;
 import com.shana.model.LlmProvider;
 import com.shana.model.TokenUsage;
+import com.shana.model.ToolCall;
+import com.shana.model.ToolSpec;
 import com.shana.model.adapter.dto.OpenAiChatMessage;
 import com.shana.model.adapter.dto.OpenAiChatRequest;
 import com.shana.model.adapter.dto.OpenAiChatResponse;
@@ -92,7 +94,8 @@ class OpenAiChatMapperTest {
     @DisplayName("序列化后的请求体：messages 是对象数组，null 字段不出现")
     void shouldSerializeMessagesAsObjectArrayAndOmitNulls() throws Exception {
         OpenAiChatRequest request =
-                new OpenAiChatRequest("deepseek-chat", List.of(new OpenAiChatMessage("user", "你好")), null, null);
+                new OpenAiChatRequest("deepseek-chat", List.of(new OpenAiChatMessage("user", "你好", null, null)),
+                        null, null, null);
 
         JsonNode body = JSON.readTree(JSON.writeValueAsString(request));
 
@@ -145,7 +148,7 @@ class OpenAiChatMapperTest {
     @DisplayName("响应体缺失 content 时翻译成服务不可用异常")
     void shouldRejectMissingContent() {
         OpenAiChatResponse response = new OpenAiChatResponse(
-                List.of(new OpenAiChatResponse.OpenAiChoice(new OpenAiChatMessage("assistant", null))), null);
+                List.of(new OpenAiChatResponse.OpenAiChoice(new OpenAiChatMessage("assistant", null, null, null))), null);
 
         assertThatThrownBy(() -> OpenAiChatMapper.toChatResponse(response, "deepseek-chat"))
                 .isInstanceOf(BusinessException.class)
@@ -160,6 +163,105 @@ class OpenAiChatMapperTest {
         assertThatThrownBy(() -> OpenAiChatMapper.toChatResponse(null, "deepseek-chat"))
                 .isInstanceOfSatisfying(BusinessException.class,
                         ex -> assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.SERVICE_UNAVAILABLE));
+    }
+
+
+    @Test
+    @DisplayName("工具声明：type 固定为 function，parameters 嵌成对象而不是转义字符串")
+    void shouldSerializeToolSpecAsFunctionObject() throws Exception {
+        ChatRequest request = new ChatRequest(LlmProvider.OPENAI_COMPATIBLE, "deepseek-chat",
+                List.of(ChatMessage.user("谁最活跃")), null, null,
+                List.of(new ToolSpec("group_message_stats", "统计发言条数", """
+                        {"type":"object","properties":{"days":{"type":"integer"}}}
+                        """)));
+
+        JsonNode body = JSON.readTree(JSON.writeValueAsString(OpenAiChatMapper.toRequest(request, defaults())));
+        JsonNode tool = body.get("tools").get(0);
+
+        assertThat(tool.get("type").asText()).isEqualTo("function");
+        assertThat(tool.get("function").get("name").asText()).isEqualTo("group_message_stats");
+        // 关键：parameters 必须是对象。写成字符串会被上游当成非法 schema
+        assertThat(tool.get("function").get("parameters").isObject()).isTrue();
+        assertThat(tool.get("function").get("parameters").get("type").asText()).isEqualTo("object");
+    }
+
+    @Test
+    @DisplayName("没有工具时请求体里不出现 tools 字段")
+    void shouldOmitToolsWhenEmpty() throws Exception {
+        ChatRequest request = ChatRequest.of(LlmProvider.OPENAI_COMPATIBLE, "deepseek-chat",
+                List.of(ChatMessage.user("hi")));
+
+        JsonNode body = JSON.readTree(JSON.writeValueAsString(OpenAiChatMapper.toRequest(request, defaults())));
+
+        assertThat(body.has("tools")).isFalse();
+    }
+
+    /** 真实 DeepSeek/OpenAI 风格的工具调用响应：content 为 null，tool_calls 里有 args 字符串。 */
+    private static final String TOOL_CALL_RESPONSE = """
+            {
+              "choices": [{
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": null,
+                  "tool_calls": [{
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": { "name": "group_message_stats", "arguments": "{\\"days\\":7}" }
+                  }]
+                },
+                "finish_reason": "tool_calls"
+              }],
+              "usage": { "prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42 }
+            }
+            """;
+
+    @Test
+    @DisplayName("解析工具调用响应：content 为空不算错误，tool_calls 被翻译成内部模型")
+    void shouldParseToolCallResponse() throws Exception {
+        OpenAiChatResponse response = JSON.readValue(TOOL_CALL_RESPONSE, OpenAiChatResponse.class);
+
+        ChatResponse mapped = OpenAiChatMapper.toChatResponse(response, "deepseek-chat");
+
+        assertThat(mapped.content()).isNull();
+        assertThat(mapped.hasToolCalls()).isTrue();
+        assertThat(mapped.toolCalls()).containsExactly(
+                new ToolCall("call_abc", "group_message_stats", "{\"days\":7}"));
+        assertThat(mapped.usage()).isEqualTo(new TokenUsage(30, 12));
+    }
+
+    @Test
+    @DisplayName("回传工具往返：assistant 带 tool_calls，tool 消息带 tool_call_id，content 该省的省")
+    void shouldSerializeToolRoundTrip() throws Exception {
+        ChatMessage toolTurn = ChatMessage.toolResult("call_abc", "u-1001：12 条");
+        ChatMessage assistantTurn = ChatMessage.assistantToolCalls(null,
+                List.of(new ToolCall("call_abc", "group_message_stats", "{\"days\":7}")));
+        ChatRequest request = ChatRequest.of(LlmProvider.OPENAI_COMPATIBLE, "deepseek-chat",
+                List.of(ChatMessage.user("谁最活跃"), assistantTurn, toolTurn));
+
+        JsonNode messages = JSON.readTree(
+                JSON.writeValueAsString(OpenAiChatMapper.toRequest(request, defaults()))).get("messages");
+
+        JsonNode assistant = messages.get(1);
+        assertThat(assistant.get("role").asText()).isEqualTo("assistant");
+        // content 为 null 时必须整个字段消失，部分兼容服务不接受 "content": null
+        assertThat(assistant.has("content")).isFalse();
+        assertThat(assistant.get("tool_calls").get(0).get("id").asText()).isEqualTo("call_abc");
+        assertThat(assistant.get("tool_calls").get(0).get("type").asText()).isEqualTo("function");
+        assertThat(assistant.get("tool_calls").get(0).get("function").get("arguments").asText())
+                .isEqualTo("{\"days\":7}");
+
+        JsonNode tool = messages.get(2);
+        assertThat(tool.get("role").asText()).isEqualTo("tool");
+        assertThat(tool.get("tool_call_id").asText()).isEqualTo("call_abc");
+        assertThat(tool.get("content").asText()).isEqualTo("u-1001：12 条");
+    }
+
+    @Test
+    @DisplayName("工具参数为空字符串时统一成空对象，避免工具自己判空")
+    void shouldNormalizeBlankArguments() {
+        assertThat(new ToolCall("c1", "echo", " ").arguments()).isEqualTo("{}");
+        assertThat(new ToolCall("c1", "echo", null).arguments()).isEqualTo("{}");
     }
 
     private static OpenAiCompatibleProperties defaults() {

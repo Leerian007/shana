@@ -1,13 +1,14 @@
 package com.shana.core.chat;
 
+import com.shana.agent.Agent;
+import com.shana.agent.AgentRequest;
+import com.shana.agent.AgentResult;
+import com.shana.agent.tool.ToolContext;
 import com.shana.core.memory.ConversationSummarizer;
 import com.shana.core.memory.MemoryPromptRenderer;
 import com.shana.memory.ConversationMemory;
 import com.shana.memory.LongTermMemory;
 import com.shana.model.ChatMessage;
-import com.shana.model.ChatRequest;
-import com.shana.model.ChatResponse;
-import com.shana.model.LlmClientRegistry;
 import com.shana.model.LlmProvider;
 import com.shana.rag.KnowledgeBase;
 import com.shana.rag.KnowledgePromptRenderer;
@@ -22,10 +23,13 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 问答链路编排：写上下文 → 拼长期记忆 → 拼检索资料 → 组装 prompt → 调模型 → 回写上下文 → 触发摘要。
+ * 问答链路编排：写上下文 → 拼长期记忆 → 拼检索资料 → 交给 Agent → 回写上下文 → 触发摘要。
  *
- * <p>本类刻意不出现任何厂商概念（HTTP、API key、JSON 字段），它只知道"有记忆、有知识库、有模型"，
+ * <p>本类刻意不出现任何厂商概念（HTTP、API key、JSON 字段），它只知道"有记忆、有知识库、有 Agent"，
  * 因此后续接入 Ollama 或自建微调模型时这里一行都不用改。
+ *
+ * <p>"模型怎么调、要不要调工具"交给 {@link Agent}，本类只负责"这一轮该让它看到什么"。
+ * 两条职责分开后，工具循环从单轮加到多轮，这里一行没动。
  *
  * <p>长期记忆、摘要生成、知识库检索都是<b>可选依赖</b>：Redis 模式、内存模式、没配嵌入模型时
  * 它们不存在，链路照常工作，只是少了对应的能力。用 {@link ObjectProvider} 而不是必填构造参数，
@@ -42,7 +46,8 @@ public class ChatServiceImpl implements ChatService {
      */
     private static final String SYSTEM_PROMPT = """
             你是 Shana，一个在群聊中参与讨论的中文 AI 助手。
-            回答简洁、直接，不复述别人刚说过的话；不确定时明确说明，不要编造。""";
+            回答简洁、直接，不复述别人刚说过的话；不确定时明确说明，不要编造。
+            需要具体数据（例如谁发言最多、群里最近聊了什么）时先调用工具查，不要凭印象回答。""";
 
     /**
      * 拼进 prompt 的事实条数上限。
@@ -59,7 +64,7 @@ public class ChatServiceImpl implements ChatService {
     private static final int MAX_KNOWLEDGE_CHUNKS = 4;
 
     private final ConversationMemory conversationMemory;
-    private final LlmClientRegistry llmClientRegistry;
+    private final Agent agent;
     private final ObjectProvider<LongTermMemory> longTermMemory;
     private final ObjectProvider<ConversationSummarizer> summarizer;
     private final ObjectProvider<KnowledgeBase> knowledgeBase;
@@ -67,14 +72,14 @@ public class ChatServiceImpl implements ChatService {
     private final boolean ragEnabled;
 
     public ChatServiceImpl(ConversationMemory conversationMemory,
-                           LlmClientRegistry llmClientRegistry,
+                           Agent agent,
                            ObjectProvider<LongTermMemory> longTermMemory,
                            ObjectProvider<ConversationSummarizer> summarizer,
                            ObjectProvider<KnowledgeBase> knowledgeBase,
                            @Value("${shana.llm.provider:OPENAI_COMPATIBLE}") LlmProvider provider,
                            @Value("${shana.rag.enabled:true}") boolean ragEnabled) {
         this.conversationMemory = conversationMemory;
-        this.llmClientRegistry = llmClientRegistry;
+        this.agent = agent;
         this.longTermMemory = longTermMemory;
         this.summarizer = summarizer;
         this.knowledgeBase = knowledgeBase;
@@ -85,7 +90,7 @@ public class ChatServiceImpl implements ChatService {
     @Override
     public ChatReply reply(String conversationId, String senderId, String message) {
         // 1. 先写入用户消息：即使本次调用失败，用户说过的话也留在上下文里，下一轮仍能接上。
-        //    senderId 只是随消息落库的旁路信息，下面组装 prompt 时不会用到它
+        //    senderId 随消息落库，同时也传给工具上下文——工具可以据此判断"谁在问"
         conversationMemory.append(conversationId, ChatMessage.user(senderId, message));
 
         // 2. 组装 prompt：system 人设 + 长期记忆 + 检索资料 + 本会话最近历史
@@ -97,18 +102,24 @@ public class ChatServiceImpl implements ChatService {
         appendKnowledge(message, messages);
         messages.addAll(history);
 
-        // 3. 调用模型。model / temperature 传 null，由适配器回落到自己的配置，业务层不关心厂商参数
-        ChatResponse response = llmClientRegistry.get(provider)
-                .chat(new ChatRequest(provider, null, messages, null, null));
+        // 3. 交给 Agent：内部可能发生 1~N 次模型调用，中间夹着工具执行
+        AgentResult result = agent.run(new AgentRequest(provider, messages,
+                new ToolContext(conversationId, senderId)));
+        if (!result.toolsUsed().isEmpty()) {
+            log.info("本次回答调用了工具: conversationId={}, tools={}, rounds={}",
+                    conversationId, result.toolsUsed(), result.rounds());
+        }
 
-        // 4. 回写助手回复，供下一轮对话使用
-        conversationMemory.append(conversationId, ChatMessage.assistant(response.content()));
+        // 4. 只回写最终回复。工具调用的中间消息不落库：
+        //    tool 消息必须紧跟它对应的 tool_calls 消息，而对话记忆按条读取、窗口还会截断，
+        //    单独存下来只会在下次请求时被上游拒绝
+        conversationMemory.append(conversationId, ChatMessage.assistant(result.content()));
 
         // 5. 顺带触发一次后台摘要。是否真的需要摘要在方法内部判断，
         //    这里不阻塞、不抛异常——记忆更新失败不能影响用户拿到回复
         triggerSummarize(conversationId);
 
-        return new ChatReply(conversationId, response.content(), response.usage());
+        return new ChatReply(conversationId, result.content(), result.usage(), result.toolsUsed());
     }
 
     private void appendLongTermMemory(String conversationId, List<ChatMessage> messages) {

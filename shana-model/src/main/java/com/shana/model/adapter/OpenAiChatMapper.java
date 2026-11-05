@@ -1,5 +1,7 @@
 package com.shana.model.adapter;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.shana.common.api.ErrorCode;
 import com.shana.common.exception.BusinessException;
 import com.shana.model.ChatMessage;
@@ -7,9 +9,13 @@ import com.shana.model.ChatRequest;
 import com.shana.model.ChatResponse;
 import com.shana.model.LlmProvider;
 import com.shana.model.TokenUsage;
+import com.shana.model.ToolCall;
+import com.shana.model.ToolSpec;
 import com.shana.model.adapter.dto.OpenAiChatMessage;
 import com.shana.model.adapter.dto.OpenAiChatRequest;
 import com.shana.model.adapter.dto.OpenAiChatResponse;
+import com.shana.model.adapter.dto.OpenAiToolCall;
+import com.shana.model.adapter.dto.OpenAiToolSpec;
 import com.shana.model.adapter.dto.OpenAiUsage;
 
 import java.util.List;
@@ -24,6 +30,8 @@ import java.util.Locale;
  * <p>本类不持有状态、不访问网络，所有方法都是纯函数，因此可以直接单测。
  */
 final class OpenAiChatMapper {
+
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private OpenAiChatMapper() {
     }
@@ -45,14 +53,16 @@ final class OpenAiChatMapper {
                 preferOr(request.model(), defaults.model()),
                 messages,
                 preferOr(request.temperature(), defaults.temperature()),
-                request.maxTokens());
+                request.maxTokens(),
+                toTools(request.tools()));
     }
 
     /**
      * 把上游响应翻译成统一响应。
      *
-     * <p>上游返回空 choices 或空 content 都属于"服务不可用"，统一翻译成
-     * {@link ErrorCode#SERVICE_UNAVAILABLE} 抛出，由上层决定如何展示。
+     * <p>上游返回空 choices 属于"服务不可用"；但 {@code content} 为空<b>不一定</b>是错误——
+     * 模型要求调用工具时 content 就是 null。所以先看 tool_calls，再判断内容，
+     * 否则每一次工具调用都会被误判成上游故障。
      *
      * @param response 上游响应体，允许为 null（例如 204 或空 body）
      * @param model    本次实际请求的模型名，用于回填 {@link ChatResponse#model()}
@@ -62,16 +72,61 @@ final class OpenAiChatMapper {
             throw new BusinessException(ErrorCode.SERVICE_UNAVAILABLE, "模型服务未返回任何回复");
         }
         OpenAiChatResponse.OpenAiChoice choice = response.choices().get(0);
-        String content = (choice == null || choice.message() == null) ? null : choice.message().content();
-        if (content == null) {
+        OpenAiChatMessage message = choice == null ? null : choice.message();
+        if (message == null) {
             throw new BusinessException(ErrorCode.SERVICE_UNAVAILABLE, "模型服务返回的回复缺少内容");
         }
-        return new ChatResponse(content, LlmProvider.OPENAI_COMPATIBLE, model, toUsage(response.usage()));
+
+        List<ToolCall> toolCalls = toToolCalls(message.toolCalls());
+        if (message.content() == null && toolCalls.isEmpty()) {
+            throw new BusinessException(ErrorCode.SERVICE_UNAVAILABLE, "模型服务返回的回复缺少内容");
+        }
+        return new ChatResponse(message.content(), LlmProvider.OPENAI_COMPATIBLE, model,
+                toUsage(response.usage()), toolCalls);
     }
 
     /** 上游要小写角色名（system / user / assistant），枚举名是大写，必须显式转换。 */
     private static OpenAiChatMessage toMessage(ChatMessage message) {
-        return new OpenAiChatMessage(message.role().name().toLowerCase(Locale.ROOT), message.content());
+        List<OpenAiToolCall> toolCalls = message.toolCalls().isEmpty()
+                ? null
+                : message.toolCalls().stream()
+                .map(call -> new OpenAiToolCall(call.id(), "function",
+                        new OpenAiToolCall.Function(call.name(), call.arguments())))
+                .toList();
+        return new OpenAiChatMessage(
+                message.role().name().toLowerCase(Locale.ROOT),
+                message.content(),
+                message.toolCallId(),
+                toolCalls);
+    }
+
+    /** 没有工具时返回 null，让字段整个消失；传空数组在部分兼容服务上会被判为非法。 */
+    private static List<OpenAiToolSpec> toTools(List<ToolSpec> tools) {
+        if (tools.isEmpty()) {
+            return null;
+        }
+        return tools.stream()
+                .map(spec -> OpenAiToolSpec.ofFunction(spec.name(), spec.description(), toJson(spec)))
+                .toList();
+    }
+
+    private static JsonNode toJson(ToolSpec spec) {
+        try {
+            return JSON.readTree(spec.parametersSchema());
+        } catch (Exception e) {
+            // ToolSpec 构造时已经校验过，走到这里说明有人绕过校验或改了实现，属于编程错误
+            throw new IllegalStateException("工具参数 schema 不是合法 JSON: " + spec.name(), e);
+        }
+    }
+
+    private static List<ToolCall> toToolCalls(List<OpenAiToolCall> toolCalls) {
+        if (toolCalls == null || toolCalls.isEmpty()) {
+            return List.of();
+        }
+        return toolCalls.stream()
+                .filter(call -> call != null && call.function() != null && call.function().name() != null)
+                .map(call -> new ToolCall(call.id(), call.function().name(), call.function().arguments()))
+                .toList();
     }
 
     private static TokenUsage toUsage(OpenAiUsage usage) {

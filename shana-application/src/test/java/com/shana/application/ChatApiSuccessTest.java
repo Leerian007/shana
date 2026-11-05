@@ -13,6 +13,8 @@ import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
+import java.util.List;
+
 import static org.mockito.BDDMockito.given;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -39,7 +41,8 @@ class ChatApiSuccessTest {
     @DisplayName("POST /api/v1/chat 返回统一结构与 token 用量")
     void shouldReturnUnifiedChatResponse() throws Exception {
         given(chatService.reply("group-1", "u-1001", "你好"))
-                .willReturn(new ChatReply("group-1", "我是 Shana", new TokenUsage(5, 9)));
+                .willReturn(new ChatReply("group-1", "我是 Shana", new TokenUsage(5, 9),
+                        List.of("group_message_stats")));
 
         mockMvc.perform(post("/api/v1/chat")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -52,7 +55,9 @@ class ChatApiSuccessTest {
                 .andExpect(jsonPath("$.data.conversationId").value("group-1"))
                 .andExpect(jsonPath("$.data.content").value("我是 Shana"))
                 .andExpect(jsonPath("$.data.promptTokens").value(5))
-                .andExpect(jsonPath("$.data.completionTokens").value(9));
+                .andExpect(jsonPath("$.data.completionTokens").value(9))
+                // 工具轨迹要透出来，否则"这次回答查没查数据"只能靠猜
+                .andExpect(jsonPath("$.data.toolsUsed[0]").value("group_message_stats"));
     }
 
     @Test

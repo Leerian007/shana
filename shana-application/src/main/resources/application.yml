@@ -88,6 +88,15 @@ shana:
       trigger-messages: ${SHANA_MEMORY_SUMMARY_TRIGGER:20}
       # 单次喂给模型的原文上限，超出的部分下一轮继续消化（摘要游标会推进）
       batch-size: ${SHANA_MEMORY_SUMMARY_BATCH:50}
+  agent:
+    # 关闭后模型不再拿到任何工具，退化成纯对话。
+    # 排查"是不是工具把回答带偏了"时用，比删代码快
+    enabled: ${SHANA_AGENT_ENABLED:true}
+    # 一次问答内最多允许几轮"模型 → 工具 → 模型"。
+    # 到上限后会撤掉工具再问一次，逼模型用已有结果作答。
+    # 调大只会让异常请求更慢更贵，真正的长任务应该走异步任务而不是聊天接口
+    max-rounds: ${SHANA_AGENT_MAX_ROUNDS:4}
+
   llm:
     # 使用哪一类模型来源，决定 LlmClientRegistry 里选哪个适配器
     provider: ${SHANA_LLM_PROVIDER:OPENAI_COMPATIBLE}

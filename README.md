@@ -5,9 +5,10 @@
 
 当前已完成：工程骨架（分层结构、统一响应、异常处理、健康检查、本地基础设施编排）、
 OpenAI 兼容协议的模型适配层、`POST /api/v1/chat` 问答链路、基于 PostgreSQL 的会话持久化、
-可切换的 Redis 上下文、长期记忆（滚动摘要 + 关键信息抽取），
-以及 **RAG**（文档切分 + Embedding + pgvector 向量检索）。
-**尚未实现** Agent 循环与群成员画像。
+可切换的 Redis 上下文、长期记忆（滚动摘要 + 关键信息抽取）、
+**RAG**（文档切分 + Embedding + pgvector 向量检索），
+以及 **Agent / 工具调用**（模型自主决定查数据，多轮往返后作答）。
+**尚未实现** 群成员画像与多 Agent 协作。
 
 ---
 
@@ -41,10 +42,10 @@ OpenAI 兼容协议的模型适配层、`POST /api/v1/chat` 问答链路、基�
 | `shana-common` | 统一响应 `Result`、错误码 `ErrorCode`、业务异常 `BusinessException` | 无 |
 | `shana-model` | 统一模型调用入口 `LlmClient`、`EmbeddingClient`、消息/请求/响应模型、`LlmClientRegistry` 路由 | common |
 | `shana-rag` | RAG 领域层：文档切分、知识库编排、向量存储端口 | common, model |
-| `shana-core` | 核心业务接口与领域模型，编排模型/记忆/知识库/工具 | common, model, memory, rag |
-| `shana-infrastructure` | 数据访问（MyBatis-Plus + PostgreSQL）、Flyway 迁移、`ConversationMemory` 与 `VectorStore` 的实现 | common, core, memory, rag |
+| `shana-core` | 核心业务接口与领域模型，编排记忆/知识库，把"调模型 + 调工具"交给 Agent | common, model, memory, rag, agent |
+| `shana-infrastructure` | 数据访问（MyBatis-Plus + PostgreSQL）、Flyway 迁移、`ConversationMemory` 与 `VectorStore` 的实现、需要真实资源的工具（群聊统计） | common, core, memory, rag, agent |
 | `shana-memory` | 群聊上下文与长期记忆管理 | common, model |
-| `shana-agent` | Agent 循环、工具调用、任务编排（当前仅工具扩展点） | common, model |
+| `shana-agent` | Agent 循环、工具扩展点与注册表、多轮工具调用编排 | common, model |
 | `shana-api` | Controller、VO、全局异常处理 | common, core, rag |
 | `shana-application` | 装配所有模块，提供启动类与配置，唯一的可执行 jar | 全部模块 |
 
@@ -55,12 +56,13 @@ shana-common            （基础类型，无业务依赖）
 
 shana-model ──▶ common
 
-shana-core  ──▶ model, memory, common
+shana-memory ──▶ model, common
+shana-agent  ──▶ model, common
 
-shana-infrastructure ──▶ core, memory   （由此传递依赖 model、common）
-shana-memory         ──▶ model, common
-shana-agent          ──▶ model, common
-shana-api            ──▶ core   （由此传递依赖 model、common）
+shana-core   ──▶ model, memory, rag, agent
+
+shana-infrastructure ──▶ core, memory, rag, agent   （由此传递依赖 model、common）
+shana-api            ──▶ core, rag   （由此传递依赖 model、common）
 
 shana-application    ──▶ api, core, infrastructure, model, memory, agent
 ```
@@ -74,9 +76,12 @@ shana-application    ──▶ api, core, infrastructure, model, memory, agent
 - `api` 只依赖 `core` 与 `common`，不认识 `infrastructure`、`model` 的具体实现；
 - `application` 是所有模块的汇合点，只做装配与配置，不写业务代码。
 
-`shana-memory` / `shana-agent` 与 `shana-core` 之间：`core` 单向依赖 `memory`
-（问答链路需要读取上下文），`memory` 只依赖 `common` + `model`，不反向依赖 `core`，
-因此仍是单向链。`agent` 目前没有编译期依赖，等实现 Agent 循环时再按同样方向接入。
+`shana-memory` / `shana-agent` 与 `shana-core` 之间：`core` 单向依赖两者
+（问答链路要读上下文，也要把"调模型 + 调工具"这一段交给 Agent），
+而 `memory`、`agent` 都只依赖 `common` + `model`，不反向依赖 `core`，因此仍是单向链。
+
+`agent` 里没有一行数据库或 HTTP 代码：它只定义"工具长什么样"和"怎么循环"，
+真正的工具实现放在 `infrastructure`——需要真实资源的东西属于资源所在的那一层。
 
 ---
 
@@ -100,7 +105,8 @@ shana/
 │       ├── LlmClient.java / EmbeddingClient.java   # 对话与向量化两个独立入口
 │       ├── LlmClientRegistry.java
 │       ├── ChatMessage.java / ChatRequest.java / ChatResponse.java
-│       └── adapter/            # OpenAI 兼容协议适配（对话 + embeddings）
+│       ├── ToolCall.java / ToolSpec.java             # 工具调用的协议模型
+│       └── adapter/            # OpenAI 兼容协议适配（对话 + embeddings + tools）
 │
 ├── shana-rag/
 │   └── src/main/java/com/shana/rag/
@@ -118,6 +124,7 @@ shana/
 ├── shana-infrastructure/
 │   └── src/main/java/com/shana/infrastructure/
 │       ├── config/             # MyBatis-Plus 配置、知识库装配
+│       ├── agent/              # 工具实现：群聊发言统计
 │       └── persistence/        # 上下文 / 长期记忆 / 知识库实现，实体与 Mapper
 │
 ├── shana-memory/
@@ -129,9 +136,13 @@ shana/
 │       └── InMemoryConversationMemory.java
 │
 ├── shana-agent/
-│   └── src/main/java/com/shana/agent/tool/
-│       ├── Tool.java
-│       └── ToolRegistry.java
+│   └── src/main/java/com/shana/agent/
+│       ├── Agent.java / AgentRequest.java / AgentResult.java
+│       ├── ToolCallingAgent.java        # 多轮工具编排
+│       └── tool/
+│           ├── Tool.java                # 扩展点
+│           ├── ToolContext.java         # 会话上下文（模型无法伪造）
+│           └── ToolRegistry.java
 │
 ├── shana-api/
 │   └── src/main/java/com/shana/api/
@@ -701,6 +712,96 @@ SELECT id, left(content, 30), (embedding::real[])[1:3] FROM rag_chunk LIMIT 5;
 
 ---
 
+## Agent：工具调用
+
+模型看不到数据库，也统计不了群里谁发言最多。**工具就是给它装的手和眼**：它自己判断要不要查、查什么，
+代码只负责把结果递回去。
+
+### 一次问答里发生了什么
+
+```
+POST /api/v1/chat
+  → 组装 prompt（人设 + 长期记忆 + 检索资料 + 历史）
+  → Agent 第 1 轮：模型返回 tool_calls
+      → 执行 group_message_stats(conversationId=当前群)
+      → 把 assistant(tool_calls) + tool(结果) 追加进消息列表
+  → Agent 第 2 轮：模型基于查询结果作答
+  → 只把最终回复写进对话记忆
+```
+
+单轮和多轮是**同一段循环**，差别只在转了几圈。不分开写是有原因的：
+两条路径的错误处理、消息拼装规则稍有出入，就会变成"单轮好好的，一旦需要查两次就报错"。
+
+### 三个关键约束
+
+**① 会话 ID 不从模型参数里读。**
+`ToolContext(conversationId, senderId)` 由调用方传入。如果让模型在 `arguments` 里填 `conversationId`，
+它就可能（幻觉或被诱导）去查另一个群——一个只该读本群的工具，变成跨群泄露的入口。
+
+**② 工具失败不中断对话。**
+执行异常转成一条文本回填给模型，由它决定怎么向用户解释。抛异常就整段失败，等于模型一调错工具
+用户就收不到回复。同理，模型编出不存在的工具时，把可用清单回给它，下一轮往往就能调对。
+
+**③ 轮次有上限，到上限要能收尾。**
+`shana.agent.max-rounds`（默认 4）到顶后，**撤掉工具再问一次**，逼模型用已有结果作答。
+直接抛错会让用户白等一场却什么都没拿到。
+
+### 工具扩展点
+
+```java
+public interface Tool {
+    String name();                                   // 全局唯一，^[a-zA-Z0-9_-]{1,64}$
+    String description();                            // 写清"什么时候该用"，这是模型唯一的判断依据
+    default String parametersSchema() { ... }        // 参数 JSON Schema，构造期校验
+    String execute(ToolContext context, String arguments);
+}
+```
+
+新增工具只需实现接口并注册为 Bean，`ToolRegistry` 自动收集。构造期会做三件事：重名检测、
+名字合法性校验、schema 可解析校验——**写错就启动失败**，而不是等到对话时才收到一句上游的 400。
+
+内置工具：
+
+| 工具 | 作用 | 参数 |
+| --- | --- | --- |
+| `group_message_stats` | 按 `sender_id` 统计当前群最近 N 天每位成员的发言条数 | `days`（1~90，默认 7） |
+
+对外壳和参数的信任度是刻意区分的：`days` 越界会被夹到 1~90（模型给 1000 天也照查 90 天），
+参数不是 JSON 就回落默认值。**参数不完美不该让整次回答失败**。
+
+### 不落库的东西
+
+`assistant(tool_calls)` 与 `tool` 消息**只在一次问答的内存里存在**。
+原因是它们必须成对出现：tool 消息脱离上一条带 `tool_calls` 的 assistant 就毫无意义，
+而对话记忆按条读取、窗口还会截断，单独存下来只会在下次请求时被上游拒绝
+（`messages with role 'tool' must be a response to a preceding message with 'tool_calls'`）。
+
+### 配置
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `shana.agent.enabled` | true | 关掉后模型拿不到任何工具，退化成纯对话。排查"是不是工具带偏了"时用 |
+| `shana.agent.max-rounds` | 4 | 一次问答内最多几轮"模型 → 工具 → 模型" |
+
+### 验证
+
+```bash
+# 问一个必须查数据的问题
+curl -X POST http://localhost:8080/api/v1/chat -H "Content-Type: application/json" \
+  -d '{"conversationId":"group-1","senderId":"u-1001","message":"这个群最近一周谁发言最多？"}'
+```
+
+预期 `data.toolsUsed` 为 `["group_message_stats"]`，日志里能看到：
+
+```
+本次回答调用了工具: conversationId=group-1, tools=[group_message_stats], rounds=2
+```
+
+`toolsUsed` 为空说明模型没查就直接答了。先检查工具说明是否写清楚"什么时候该用"——
+模型不调工具，九成是描述让它没意识到该调。
+
+---
+
 ## Docker Compose（PostgreSQL / Redis）
 
 ```bash
@@ -773,10 +874,15 @@ curl -X POST http://localhost:8080/api/v1/chat \
     "conversationId": "group-1",
     "content": "你好，我是 Shana。",
     "promptTokens": 42,
-    "completionTokens": 18
+    "completionTokens": 18,
+    "toolsUsed": []
   }
 }
 ```
+
+`toolsUsed` 是这次回答实际调用过的工具名（按执行顺序）。问"群里谁最活跃"而模型真的查了库，
+这里会是 `["group_message_stats"]`；为空说明它只是凭上下文作答。
+排查"AI 答得不对"时先看这个字段——很多时候问题不在模型，而在于它压根没去查。
 
 | 入参 | 校验 | 说明 |
 | --- | --- | --- |
@@ -954,6 +1060,8 @@ curl "http://localhost:8080/api/v1/knowledge/search?q=你的问题&topK=10"
 6. ~~**RAG**：文档切分、Embedding、向量检索（PostgreSQL pgvector 或独立向量库）~~
    ✅ 已完成（TextSplitter + OpenAI 兼容 /embeddings + pgvector HNSW，检索结果独立注入 prompt）；
    待补：PDF/Word 解析、混合检索（向量 + 关键词）、rerank、多租户知识库隔离。
-7. **Agent / Tool Calling**：基于 `Tool` 扩展点实现单轮工具调用，再演进到多轮编排。
+7. ~~**Agent / Tool Calling**：基于 `Tool` 扩展点实现单轮工具调用，再演进到多轮编排~~
+   ✅ 已完成（`ToolCallingAgent` 多轮循环 + 轮次上限兜底 + 首个真实工具「群聊发言统计」）；
+   待补：一次性并行调用、工具级超时、多 Agent 协作。
 8. **群聊分析与月度总结**：批量任务 + 报表输出。
 9. **流式输出**：把 `POST /api/v1/chat` 扩展为 SSE，边生成边返回，避免长时间等待。

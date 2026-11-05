@@ -33,6 +33,11 @@
             <groupId>com.shana</groupId>
             <artifactId>shana-rag</artifactId>
         </dependency>
+        <!-- 对话编排把"调模型 + 可能调工具"这一段交给 Agent；agent 只依赖 model，不反向依赖 core -->
+        <dependency>
+            <groupId>com.shana</groupId>
+            <artifactId>shana-agent</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter</artifactId>

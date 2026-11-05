@@ -28,6 +28,8 @@ class ToolRegistryTest {
 
         assertThat(registry.find("not-exists")).isEmpty();
         assertThat(registry.all()).isEmpty();
+        assertThat(registry.isEmpty()).isTrue();
+        assertThat(registry.specs()).isEmpty();
     }
 
     @Test
@@ -36,6 +38,23 @@ class ToolRegistryTest {
         assertThatThrownBy(() -> new ToolRegistry(List.of(new EchoTool(), new EchoTool())))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("echo");
+    }
+
+    @Test
+    @DisplayName("说明书在构造期一次性构建，顺序与注册顺序一致")
+    void shouldBuildSpecsInRegistrationOrder() {
+        ToolRegistry registry = new ToolRegistry(List.of(new EchoTool(), new UpperTool()));
+
+        assertThat(registry.specs()).extracting("name").containsExactly("echo", "upper");
+        assertThat(registry.specs().getFirst().description()).isEqualTo("回显入参，仅用于测试");
+    }
+
+    @Test
+    @DisplayName("工具名不合法时构造注册表就失败，而不是等到第一次对话")
+    void shouldRejectIllegalToolNameAtStartup() {
+        assertThatThrownBy(() -> new ToolRegistry(List.of(new ChineseNameTool())))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("工具名");
     }
 
     /** 测试替身：原样返回入参。 */
@@ -52,8 +71,44 @@ class ToolRegistryTest {
         }
 
         @Override
-        public String execute(String arguments) {
+        public String execute(ToolContext context, String arguments) {
             return arguments;
+        }
+    }
+
+    private static final class UpperTool implements Tool {
+
+        @Override
+        public String name() {
+            return "upper";
+        }
+
+        @Override
+        public String description() {
+            return "转大写，仅用于测试";
+        }
+
+        @Override
+        public String execute(ToolContext context, String arguments) {
+            return arguments.toUpperCase();
+        }
+    }
+
+    private static final class ChineseNameTool implements Tool {
+
+        @Override
+        public String name() {
+            return "查群成员";
+        }
+
+        @Override
+        public String description() {
+            return "名字不符合上游限制";
+        }
+
+        @Override
+        public String execute(ToolContext context, String arguments) {
+            return "";
         }
     }
 }

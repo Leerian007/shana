@@ -12,13 +12,15 @@ import java.util.Objects;
  * @param messages    对话消息列表，至少一条且不可变
  * @param temperature 采样温度，null 表示使用适配器默认值
  * @param maxTokens   最大输出 token 数，null 表示使用适配器默认值
+ * @param tools       本次允许模型调用的工具，空列表表示<b>不传这个字段</b>（而不是传空数组）
  */
 public record ChatRequest(
         LlmProvider provider,
         String model,
         List<ChatMessage> messages,
         Double temperature,
-        Integer maxTokens) {
+        Integer maxTokens,
+        List<ToolSpec> tools) {
 
     public ChatRequest {
         Objects.requireNonNull(provider, "provider must not be null");
@@ -27,10 +29,21 @@ public record ChatRequest(
             throw new IllegalArgumentException("messages must not be empty");
         }
         messages = List.copyOf(messages);
+        tools = tools == null ? List.of() : List.copyOf(tools);
+    }
+
+    /** 不带工具的请求。 */
+    public ChatRequest(LlmProvider provider, String model, List<ChatMessage> messages,
+                       Double temperature, Integer maxTokens) {
+        this(provider, model, messages, temperature, maxTokens, List.of());
     }
 
     /** 只关心"用哪个模型、问什么"时的简化构造。 */
     public static ChatRequest of(LlmProvider provider, String model, List<ChatMessage> messages) {
-        return new ChatRequest(provider, model, messages, null, null);
+        return new ChatRequest(provider, model, messages, null, null, List.of());
+    }
+
+    public boolean hasTools() {
+        return !tools.isEmpty();
     }
 }
