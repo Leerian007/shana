@@ -40,14 +40,14 @@ OpenAI 兼容协议的模型适配层、`POST /api/v1/chat` 问答链路、基�
 | 模块 | 职责 | 依赖 |
 | --- | --- | --- |
 | `shana-common` | 统一响应 `Result`、错误码 `ErrorCode`、业务异常 `BusinessException` | 无 |
-| `shana-model` | 统一模型调用入口 `LlmClient`、`EmbeddingClient`、消息/请求/响应模型、`LlmClientRegistry` 路由 | common |
+| `shana-model` | 统一模型调用入口 `LlmClient` / `StreamingLlmClient`、`EmbeddingClient`、消息/请求/响应模型、`LlmClientRegistry` 路由 | common |
 | `shana-rag` | RAG 领域层：文档切分、知识库编排、向量存储端口 | common, model |
 | `shana-report` | 群聊分析领域层：月度统计模型、报表编排、Markdown 渲染、话题归纳 | common, model |
 | `shana-core` | 核心业务接口与领域模型，编排记忆/知识库，把"调模型 + 调工具"交给 Agent | common, model, memory, rag, agent |
 | `shana-infrastructure` | 数据访问（MyBatis-Plus + PostgreSQL）、Flyway 迁移、`ConversationMemory` 与 `VectorStore` 的实现、需要真实资源的工具（群聊统计）、报表取数与落盘 | common, core, memory, rag, agent, report |
 | `shana-memory` | 群聊上下文与长期记忆管理 | common, model |
 | `shana-agent` | Agent 循环、工具扩展点与注册表、多轮工具调用编排 | common, model |
-| `shana-api` | Controller、VO、全局异常处理 | common, core, rag, report |
+| `shana-api` | Controller、VO、全局异常处理、SSE 事件适配与流式线程池 | common, core, rag, report |
 | `shana-application` | 装配所有模块，提供启动类与配置，唯一的可执行 jar | 全部模块 |
 
 依赖图（`──▶` 表示"依赖"，箭头指向被依赖方）：
@@ -158,8 +158,10 @@ shana/
 │
 ├── shana-api/
 │   └── src/main/java/com/shana/api/
-│       ├── controller/         # HealthController、ChatController、KnowledgeController、ReportController
+│       ├── controller/         # HealthController、ChatController（含 /stream）、KnowledgeController、ReportController
 │       ├── dto/ vo/            # 请求体与响应体
+│       ├── stream/             # SSE 事件适配：SseChatStreamHandler、ClientGoneException
+│       ├── config/             # 流式问答专用线程池
 │       └── handler/GlobalExceptionHandler.java
 │
 └── shana-application/
@@ -948,6 +950,136 @@ group by conversation_id;"
 
 ---
 
+## 流式问答（SSE）
+
+`POST /api/v1/chat/stream` 把一次回答拆成多个事件推出：模型每吐几个字，客户端就能看到几个字，
+不必等整段生成完。原来那个 `POST /api/v1/chat` 保持不变，两者共用同一套记忆、检索与摘要逻辑，
+**用哪个接口不影响上下文与统计数据**。
+
+### 事件协议
+
+```text
+event: meta    {"conversationId":"g1"}            连接建立，回显会话
+event: delta   {"text":"你"}                       正文增量，可重复多次
+event: reset   {"round":2}                         丢弃已展示内容，从头开始
+event: tool    {"name":"group_message_stats"}      正在执行工具
+event: done    {"content":"...","promptTokens":..} 结束，content 为落库的最终文本
+event: error   {"code":503,"message":"..."}        失败
+```
+
+两个事件需要客户端特别处理：
+
+- **`reset`**：模型有时会先说一句"我查一下"再调工具，这段过渡语已经推给你了，但它不是答案、
+  也不会落库。收到 `reset` 就把气泡清空重画，保证"用户看到的"和"系统记住的"是同一段话；
+- **`done`**：`content` 是权威正文（已写入会话）。客户端如果只渲染 delta，
+  内容通常与它一致；不一致时以 `done` 为准。
+
+### 客户端示例
+
+`EventSource` 只能发 GET，带 body 的 POST 请求要用 `fetch` + 流式读取：
+
+```javascript
+const resp = await fetch('/api/v1/chat/stream', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+  body: JSON.stringify({ conversationId: 'group-1', senderId: 'u-1001', message: '谁最活跃' })
+});
+const reader = resp.body.getReader();
+const decoder = new TextDecoder();
+let buffer = '', text = '';
+while (true) {
+  const { value, done } = await reader.read();
+  if (done) break;
+  buffer += decoder.decode(value, { stream: true });
+  let idx;
+  while ((idx = buffer.indexOf('\n\n')) >= 0) {
+    const frame = buffer.slice(0, idx);
+    buffer = buffer.slice(idx + 2);
+    const event = /^event:(.+)$/m.exec(frame)?.[1].trim();
+    const data = JSON.parse(/^data:(.+)$/m.exec(frame)?.[1] ?? '{}');
+    if (event === 'delta') text += data.text;
+    else if (event === 'reset') text = '';
+    else if (event === 'done') text = data.content;
+    else if (event === 'error') console.error(data.code, data.message);
+  }
+}
+```
+
+命令行验证：
+
+```bash
+curl -N -X POST http://localhost:8080/api/v1/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"conversationId":"g1","senderId":"u1","message":"用三句话介绍你自己"}'
+```
+
+### 流式与工具调用怎么共存
+
+模型要求调用工具的那一轮没有正文可推（`delta` 里是 `tool_calls` 而不是 `content`），
+所以那一轮用户只会看到 `tool` 事件。真正的正文在工具执行完之后的那一轮流出，
+两轮之间用 `reset` 划清界限。
+
+实现上流式不是一条独立分支：`ToolCallingAgent` 只在"怎么拿到响应"这一层分叉
+（`StreamingLlmClient` 存在就走流式，否则整段请求完再一次性推送），
+循环、工具轮次、错误处理、用量累加全部共用。换一个不支持 SSE 的模型来源时，
+接口与前端代码都不用改，只是失去逐字效果。
+
+### 四个设计取舍
+
+1. **用 `SseEmitter` 而不是 WebFlux**。项目是 Spring MVC，为一个接口引入响应式栈不值当。
+   代价是生成过程要自己找线程跑（`chatStreamExecutor`），换来的是不用维护两套 Web 技术栈。
+2. **流式调用直接走 JDK `HttpClient`**。`RestClient` 的响应体是否边收边读取决于底层请求工厂，
+   某些实现会先把整个响应读进内存再交出来——那样 SSE 会退化成"最后一次性返回"，
+   而且从外部完全看不出来。`BodyHandlers.ofInputStream()` 是明确拿到一条流。
+3. **下游线程池单独一套**。SSE 会占住线程直到生成结束，跟"快进快出"的普通接口模型完全不同，
+   混在一起会让几十个人同时在等回答时把 Web 容器拖垮。队列故意留小：
+   流式请求排队等于"连上了却一个字都收不到"，宁可快速失败让客户端重试。
+4. **失败只能用事件表达**。SSE 的响应头在第一个事件发出时就已提交，之后再出错没有地方写状态码。
+   参数校验、并发拒绝这类"还没开始生成"的错误仍走统一 JSON + HTTP 状态码，
+   一旦开推就只走 `error` 事件——客户端必须以事件为准，不能只看 HTTP 200。
+
+### 客户端断开
+
+写失败会被识别成"没人听了"，随即停止生成并关闭上游连接，不再为一个没人接收的响应烧 token。
+此时**不会**写入半截回复：`done` 之前的内容都不落库，下一轮对话看到的是完整的历史。
+
+### 配置
+
+```yaml
+shana:
+  stream:
+    timeout-ms: 180000     # 单条连接最长存活时间
+    executor:
+      core-size: 4         # 约等于"同时有多少人在等回答"
+      max-size: 16
+      queue-capacity: 64   # 故意留小，排队对流式体验很差
+```
+
+模型侧还可以关掉流式用量上报（默认开）：
+
+```yaml
+shana:
+  llm:
+    openai-compatible:
+      stream-include-usage: true   # 关掉后流式模式下 token 统计恒为 0
+```
+
+### 验证
+
+```bash
+# 观察事件到达时间：首帧明显早于 done，才说明是真的流式
+curl -N -X POST http://localhost:8080/api/v1/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"conversationId":"g1","message":"用大约 300 字解释向量检索"}'
+```
+
+实测（DeepSeek，593 字回答）：`meta` 214ms、首个 `delta` 826ms、357 个 delta 帧在 2.4 秒内陆续到达、
+`done` 3230ms；流式文本与 `done.content` 都是 593 字，完全一致。
+工具轮次：`tool` 事件 1098ms → `reset` 1104ms → 正文 1506ms 起流，`toolsUsed=["group_message_stats"]`。
+中途强行断开连接：库里只留用户消息、没有半截回复，日志只有两条 debug（无 ERROR）。
+
+---
+
 ## Docker Compose（PostgreSQL / Redis）
 
 ```bash
@@ -1212,4 +1344,7 @@ curl "http://localhost:8080/api/v1/knowledge/search?q=你的问题&topK=10"
 8. ~~**群聊分析与月度总结**：批量任务 + 报表输出~~
    ✅ 已完成（SQL 聚合 + AI 话题归纳 + Markdown 报表 + 每月 1 号定时任务 + 生成/查询接口）；
    待补：按周/按人报表、报表对比（环比上月）、HTML 可视化、导出 Excel。
-9. **流式输出**：把 `POST /api/v1/chat` 扩展为 SSE，边生成边返回，避免长时间等待。
+9. ~~**流式输出**：把 `POST /api/v1/chat` 扩展为 SSE，边生成边返回，避免长时间等待~~
+   ✅ 已完成（`POST /api/v1/chat/stream`，`meta`/`delta`/`reset`/`tool`/`done`/`error` 六类事件，
+   工具轮次与纯文本共用一套循环，客户端断开即停止生成）；
+   待补：流式过程中的空闲超时检测、多实例下的连接粘性与限流。

@@ -109,7 +109,7 @@ class OpenAiCompatibleLlmClientTest {
     @DisplayName("base-url 缺失时启动期直接失败，而不是等到第一次调用")
     void shouldFailFastWhenBaseUrlMissing() {
         OpenAiCompatibleProperties broken =
-                new OpenAiCompatibleProperties(" ", "test-key", "test-model", 0.7);
+                new OpenAiCompatibleProperties(" ", "test-key", "test-model", 0.7, null);
 
         assertThatThrownBy(() -> OpenAiCompatibleLlmClient.create(broken, RestClient.builder()))
                 .isInstanceOf(IllegalStateException.class)
@@ -126,6 +126,6 @@ class OpenAiCompatibleLlmClientTest {
     }
 
     private static OpenAiCompatibleProperties properties() {
-        return new OpenAiCompatibleProperties("https://llm.test/v1", "test-key", "test-model", 0.7);
+        return new OpenAiCompatibleProperties("https://llm.test/v1", "test-key", "test-model", 0.7, null);
     }
 }

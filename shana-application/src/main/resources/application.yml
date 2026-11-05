@@ -97,6 +97,17 @@ shana:
     # 调大只会让异常请求更慢更贵，真正的长任务应该走异步任务而不是聊天接口
     max-rounds: ${SHANA_AGENT_MAX_ROUNDS:4}
 
+  # 流式问答（SSE，POST /api/v1/chat/stream）。把一次回答拆成多个事件推出，避免长回答让人干等
+  stream:
+    # 单条 SSE 连接的最长存活时间。超时由容器断开，防止客户端消失后线程一直挂着
+    timeout-ms: ${SHANA_STREAM_TIMEOUT_MS:180000}
+    executor:
+      # SSE 会占住线程直到生成结束，池子大小约等于"同时有多少人在等回答"
+      core-size: ${SHANA_STREAM_CORE_SIZE:4}
+      max-size: ${SHANA_STREAM_MAX_SIZE:16}
+      # 队列故意留小：流式请求排队等于"连上了却一个字都收不到"，宁可快速失败让客户端重试
+      queue-capacity: ${SHANA_STREAM_QUEUE:64}
+
   llm:
     # 使用哪一类模型来源，决定 LlmClientRegistry 里选哪个适配器
     provider: ${SHANA_LLM_PROVIDER:OPENAI_COMPATIBLE}

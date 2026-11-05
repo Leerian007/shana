@@ -14,6 +14,7 @@ import com.shana.model.ToolSpec;
 import com.shana.model.adapter.dto.OpenAiChatMessage;
 import com.shana.model.adapter.dto.OpenAiChatRequest;
 import com.shana.model.adapter.dto.OpenAiChatResponse;
+import com.shana.model.adapter.dto.OpenAiStreamOptions;
 import com.shana.model.adapter.dto.OpenAiToolCall;
 import com.shana.model.adapter.dto.OpenAiToolSpec;
 import com.shana.model.adapter.dto.OpenAiUsage;
@@ -55,6 +56,19 @@ final class OpenAiChatMapper {
                 preferOr(request.temperature(), defaults.temperature()),
                 request.maxTokens(),
                 toTools(request.tools()));
+    }
+
+    /**
+     * 在 {@link #toRequest} 的基础上加上流式开关。
+     *
+     * <p>复用同一个方法而不是复制一份：请求体的其余部分（消息、温度、工具）在两种模式下必须完全一致，
+     * 否则会出现"同一个问题，非流式答对了、流式答错了"这种最难查的差异。
+     */
+    static OpenAiChatRequest toStreamRequest(ChatRequest request, OpenAiCompatibleProperties defaults) {
+        OpenAiChatRequest base = toRequest(request, defaults);
+        return new OpenAiChatRequest(base.model(), base.messages(), base.temperature(), base.maxTokens(),
+                base.tools(), Boolean.TRUE,
+                defaults.includeStreamUsage() ? new OpenAiStreamOptions(true) : null);
     }
 
     /**

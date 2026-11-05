@@ -266,6 +266,6 @@ class OpenAiChatMapperTest {
 
     private static OpenAiCompatibleProperties defaults() {
         return new OpenAiCompatibleProperties(
-                "https://api.deepseek.com/v1", "test-key", "default-model", 0.7);
+                "https://api.deepseek.com/v1", "test-key", "default-model", 0.7, null);
     }
 }

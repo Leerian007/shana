@@ -1,6 +1,7 @@
 package com.shana.core.chat;
 
 import com.shana.agent.Agent;
+import com.shana.agent.AgentListener;
 import com.shana.agent.AgentRequest;
 import com.shana.agent.AgentResult;
 import com.shana.agent.tool.ToolContext;
@@ -89,37 +90,88 @@ public class ChatServiceImpl implements ChatService {
 
     @Override
     public ChatReply reply(String conversationId, String senderId, String message) {
-        // 1. 先写入用户消息：即使本次调用失败，用户说过的话也留在上下文里，下一轮仍能接上。
-        //    senderId 随消息落库，同时也传给工具上下文——工具可以据此判断"谁在问"
+        AgentResult result = agent.run(new AgentRequest(provider, prepare(conversationId, senderId, message),
+                new ToolContext(conversationId, senderId)));
+        return finish(conversationId, result);
+    }
+
+    /**
+     * 流式版本：除了"边生成边推"，与非流式完全同一条链路。
+     *
+     * <p>没有为流式单独写一份编排，是因为这份编排里每一步都有代价：漏掉一次记忆回写，
+     * 用户下一轮就会觉得助手失忆；漏掉一次摘要触发，长期记忆就永远停在旧游标上。
+     * 两条路径共享代码，才不会有"非流式好好的，一开流式就记不住"这种问题。
+     */
+    @Override
+    public void replyStream(String conversationId, String senderId, String message, ChatStreamHandler handler) {
+        AgentResult result = agent.run(
+                new AgentRequest(provider, prepare(conversationId, senderId, message),
+                        new ToolContext(conversationId, senderId)),
+                bridge(handler));
+        handler.onComplete(finish(conversationId, result));
+    }
+
+    /**
+     * 写入用户消息并组装这一轮的完整 prompt。
+     *
+     * <p>先写消息再拼 prompt：即使本次调用失败，用户说过的话也留在上下文里，下一轮仍能接上；
+     * 同时历史里已经包含刚写入的这条（时间正序），不需要再单独追加。
+     */
+    private List<ChatMessage> prepare(String conversationId, String senderId, String message) {
+        // senderId 随消息落库，同时也传给工具上下文——工具可以据此判断"谁在问"
         conversationMemory.append(conversationId, ChatMessage.user(senderId, message));
 
-        // 2. 组装 prompt：system 人设 + 长期记忆 + 检索资料 + 本会话最近历史
-        //    （history 已含刚写入的这条，时间正序）
         List<ChatMessage> history = conversationMemory.history(conversationId);
         List<ChatMessage> messages = new ArrayList<>(history.size() + 3);
         messages.add(ChatMessage.system(SYSTEM_PROMPT));
         appendLongTermMemory(conversationId, messages);
         appendKnowledge(message, messages);
         messages.addAll(history);
+        return messages;
+    }
 
-        // 3. 交给 Agent：内部可能发生 1~N 次模型调用，中间夹着工具执行
-        AgentResult result = agent.run(new AgentRequest(provider, messages,
-                new ToolContext(conversationId, senderId)));
+    /**
+     * 把 Agent 的结果写回会话并收尾。
+     *
+     * <p>只回写最终回复。工具调用的中间消息不落库：tool 消息必须紧跟它对应的 tool_calls 消息，
+     * 而对话记忆按条读取、窗口还会截断，单独存下来只会在下次请求时被上游拒绝。
+     */
+    private ChatReply finish(String conversationId, AgentResult result) {
         if (!result.toolsUsed().isEmpty()) {
             log.info("本次回答调用了工具: conversationId={}, tools={}, rounds={}",
                     conversationId, result.toolsUsed(), result.rounds());
         }
 
-        // 4. 只回写最终回复。工具调用的中间消息不落库：
-        //    tool 消息必须紧跟它对应的 tool_calls 消息，而对话记忆按条读取、窗口还会截断，
-        //    单独存下来只会在下次请求时被上游拒绝
         conversationMemory.append(conversationId, ChatMessage.assistant(result.content()));
 
-        // 5. 顺带触发一次后台摘要。是否真的需要摘要在方法内部判断，
-        //    这里不阻塞、不抛异常——记忆更新失败不能影响用户拿到回复
+        // 顺带触发一次后台摘要。是否真的需要摘要在方法内部判断，
+        // 这里不阻塞、不抛异常——记忆更新失败不能影响用户拿到回复
         triggerSummarize(conversationId);
 
         return new ChatReply(conversationId, result.content(), result.usage(), result.toolsUsed());
+    }
+
+    /** 把 Agent 的回调转成用例层面的回调，两边接口分开演进，互不牵连。 */
+    private static AgentListener bridge(ChatStreamHandler handler) {
+        if (handler == ChatStreamHandler.NOOP) {
+            return AgentListener.NOOP;
+        }
+        return new AgentListener() {
+            @Override
+            public void onRoundStart(int round) {
+                handler.onRoundStart(round);
+            }
+
+            @Override
+            public void onText(String delta) {
+                handler.onDelta(delta);
+            }
+
+            @Override
+            public void onToolCall(String toolName) {
+                handler.onTool(toolName);
+            }
+        };
     }
 
     private void appendLongTermMemory(String conversationId, List<ChatMessage> messages) {

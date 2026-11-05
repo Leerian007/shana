@@ -20,6 +20,7 @@ import com.shana.model.ChatRole;
 import com.shana.model.LlmClient;
 import com.shana.model.LlmClientRegistry;
 import com.shana.model.LlmProvider;
+import com.shana.model.StreamingLlmClient;
 import com.shana.model.TokenUsage;
 import com.shana.model.ToolCall;
 import com.shana.rag.KnowledgeBase;
@@ -31,6 +32,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.springframework.beans.factory.ObjectProvider;
 
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.stream.Stream;
@@ -89,6 +91,42 @@ class ChatServiceImplTest {
         verify(memory).append(CONVERSATION_ID, ChatMessage.user("u-1001", "你好"));
         // 助手回复没有发送者概念
         verify(memory).append(CONVERSATION_ID, ChatMessage.assistant("收到"));
+    }
+
+    @Test
+    @DisplayName("流式回复：增量逐个透传，结束时记忆已写好")
+    void shouldStreamAndPersistReply() {
+        given(memory.history(CONVERSATION_ID)).willReturn(List.of());
+        StreamingLlmClient streaming = mock(StreamingLlmClient.class);
+        given(streaming.provider()).willReturn(LlmProvider.OPENAI_COMPATIBLE);
+        given(registry.get(LlmProvider.OPENAI_COMPATIBLE)).willReturn(streaming);
+        given(streaming.streamChat(any(), any())).willAnswer(invocation -> {
+            java.util.function.Consumer<String> sink = invocation.getArgument(1);
+            sink.accept("你");
+            sink.accept("好");
+            return new ChatResponse("你好", LlmProvider.OPENAI_COMPATIBLE, "test-model", TokenUsage.unknown());
+        });
+
+        List<String> deltas = new ArrayList<>();
+        ChatReply[] completed = new ChatReply[1];
+
+        chatService.replyStream(CONVERSATION_ID, "u-1001", "你好", new ChatStreamHandler() {
+            @Override
+            public void onDelta(String text) {
+                deltas.add(text);
+            }
+
+            @Override
+            public void onComplete(ChatReply reply) {
+                // 回调时记忆必须已经写好：否则用户看到回答立刻追问，会撞上还没落库的窗口
+                verify(memory).append(CONVERSATION_ID, ChatMessage.assistant("你好"));
+                completed[0] = reply;
+            }
+        });
+
+        assertThat(deltas).containsExactly("你", "好");
+        assertThat(completed[0].content()).isEqualTo("你好");
+        verify(memory).append(CONVERSATION_ID, ChatMessage.user("u-1001", "你好"));
     }
 
     @Test
